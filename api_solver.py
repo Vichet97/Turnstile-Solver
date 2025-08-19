@@ -8,8 +8,15 @@ import logging
 import asyncio
 import argparse
 from quart import Quart, request, jsonify
-from camoufox.async_api import AsyncCamoufox
 from patchright.async_api import async_playwright
+
+# Optional camoufox import
+try:
+    from camoufox.async_api import AsyncCamoufox
+    CAMOUFOX_AVAILABLE = True
+except ImportError:
+    AsyncCamoufox = None
+    CAMOUFOX_AVAILABLE = False
 
 
 COLORS = {
@@ -121,7 +128,7 @@ class TurnstileAPIServer:
         self.app.before_serving(self._startup)
         self.app.route('/turnstile', methods=['GET'])(self.process_turnstile)
         self.app.route('/result', methods=['GET'])(self.get_result)
-        self.app.route('/')(self.index)
+        self.app.route('/readme')(self.index)
 
     async def _startup(self) -> None:
         """Initialize the browser and page pool on startup."""
@@ -138,6 +145,8 @@ class TurnstileAPIServer:
         if self.browser_type in ['chromium', 'chrome', 'msedge']:
             playwright = await async_playwright().start()
         elif self.browser_type == "camoufox":
+            if not CAMOUFOX_AVAILABLE:
+                raise ValueError("Camoufox is not available. Please install camoufox or use a different browser type.")
             camoufox = AsyncCamoufox(headless=self.headless)
 
         for _ in range(self.thread_count):
@@ -356,16 +365,20 @@ def create_app(headless: bool, useragent: str, debug: bool, browser_type: str, t
 
 if __name__ == '__main__':
     args = parse_args()
-    browser_types = [
-        'chromium',
-        'chrome',
-        'msedge',
-        'camoufox',
-    ]
+    browser_types = ['chromium', 'chrome', 'msedge']
+    if CAMOUFOX_AVAILABLE:
+        browser_types.append('camoufox')
+    
     if args.browser_type not in browser_types:
-        logger.error(f"Unknown browser type: {COLORS.get('RED')}{args.browser_type}{COLORS.get('RESET')} Available browser types: {browser_types}")
-    elif args.headless is True and args.useragent is None and "camoufox" not in args.browser_type:
-        logger.error(f"You must specify a {COLORS.get('YELLOW')}User-Agent{COLORS.get('RESET')} for Turnstile Solver or use {COLORS.get('GREEN')}camoufox{COLORS.get('RESET')} without useragent")
+        if args.browser_type == 'camoufox' and not CAMOUFOX_AVAILABLE:
+            logger.error(f"Camoufox is not available. Please install camoufox or use a different browser type. Available browser types: {browser_types}")
+        else:
+            logger.error(f"Unknown browser type: {COLORS.get('RED')}{args.browser_type}{COLORS.get('RESET')} Available browser types: {browser_types}")
+    elif args.headless is True and args.useragent is None and args.browser_type != 'camoufox':
+        if CAMOUFOX_AVAILABLE:
+            logger.error(f"You must specify a {COLORS.get('YELLOW')}User-Agent{COLORS.get('RESET')} for Turnstile Solver or use {COLORS.get('GREEN')}camoufox{COLORS.get('RESET')} without useragent")
+        else:
+            logger.error(f"You must specify a {COLORS.get('YELLOW')}User-Agent{COLORS.get('RESET')} for Turnstile Solver when using headless mode")
     else:
         app = create_app(headless=args.headless, debug=args.debug, useragent=args.useragent, browser_type=args.browser_type, thread=args.thread, proxy_support=args.proxy)
         app.run(host=args.host, port=int(args.port))

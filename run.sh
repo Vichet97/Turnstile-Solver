@@ -29,8 +29,7 @@ stop_xrdp_services() {
 
 if id "root" &>/dev/null; then
     echo "root:root" | chpasswd || {
-        echo "Failed to update password."
-        exit 1
+        echo "Failed to update password, continuing..."
     }
 else
     if ! getent group root >/dev/null; then
@@ -38,16 +37,13 @@ else
     fi
 
     useradd -m -s /bin/bash -g root root || {
-        echo "Failed to create user."
-        exit 1
+        echo "Failed to create user, continuing..."
     }
     echo "root:root" | chpasswd || {
-        echo "Failed to set password."
-        exit 1
+        echo "Failed to set password, continuing..."
     }
     usermod -aG sudo root || {
-        echo "Failed to add user to sudo."
-        exit 1
+        echo "Failed to add user to sudo, continuing..."
     }
 fi
 
@@ -56,25 +52,12 @@ if [ -n "$TZ" ]; then
     echo $TZ >/etc/timezone
 fi
 
-mkdir -p /root/Desktop
-
-cd /root/Desktop || {
-    echo "Failed to change directory to /root/Desktop"
-    exit 1
-}
-
-git clone https://github.com/Theyka/Turnstile-Solver.git
-cd Turnstile-Solver || {
-    echo "Failed to change directory to Turnstile-Solver"
-    exit 1
-}
-
-pip3 install -r requirements.txt --break-system-packages
-
-trap "stop_xrdp_services" SIGKILL SIGTERM SIGHUP SIGINT EXIT
-start_xrdp_services
-
 if [ "$RUN_API_SOLVER" = "true" ]; then
-    echo "Starting API solver in headful mode..."
-    xvfb-run -a python3 /root/Desktop/Turnstile-Solver/api_solver.py --browser_type chrome --host 0.0.0.0
+    echo "Starting API solver with virtual display..."
+    xvfb-run -a python api_solver.py --browser_type chrome --host 0.0.0.0
+else
+    trap "stop_xrdp_services" SIGKILL SIGTERM SIGHUP SIGINT EXIT
+    start_xrdp_services
+    # Keep container running
+    tail -f /dev/null
 fi

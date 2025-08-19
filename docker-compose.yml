@@ -1,0 +1,32 @@
+services:
+  turnstile-solver:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: turnstile-solver
+    ports:
+      - "5510:5000"
+    environment:
+      - PYTHONUNBUFFERED=1
+      - DISPLAY=:99
+      - RUN_API_SOLVER=true
+    volumes:
+      # Optional: Mount logs directory for persistence
+      - ./logs:/app/logs
+    restart: unless-stopped
+    # Add shared memory size for browser stability
+    shm_size: 2gb
+    # Security options for X11 and browsers
+    security_opt:
+      - seccomp:unconfined
+    # Add privileges for X11
+    privileged: false
+    tmpfs:
+      - /tmp/.X11-unix:rw,noexec,nosuid,size=100k
+    # Resource limits
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+        reservations:
+          memory: 1G
