@@ -1,0 +1,34 @@
+{
+  "mcpServers": {
+    "qtwx-mcp-1": {
+      "command": "node",
+      "args": [
+        "c:/Users/Admin/AppData/Roaming/Cursor/User/workspaceStorage/93f35907689405ee422a5506a8f810f1/QingTian.qingtian-v2/runtime/mcp-server/index.mjs"
+      ],
+      "env": {
+        "QINGTIAN_SESSION": "1",
+        "QINGTIAN_QUEUE_ROOT": "c:/Users/Admin/AppData/Roaming/Cursor/User/workspaceStorage/93f35907689405ee422a5506a8f810f1/QingTian.qingtian-v2/runtime/messages"
+      }
+    },
+    "qtwx-mcp-2": {
+      "command": "node",
+      "args": [
+        "c:/Users/Admin/AppData/Roaming/Cursor/User/workspaceStorage/93f35907689405ee422a5506a8f810f1/QingTian.qingtian-v2/runtime/mcp-server/index.mjs"
+      ],
+      "env": {
+        "QINGTIAN_SESSION": "2",
+        "QINGTIAN_QUEUE_ROOT": "c:/Users/Admin/AppData/Roaming/Cursor/User/workspaceStorage/93f35907689405ee422a5506a8f810f1/QingTian.qingtian-v2/runtime/messages"
+      }
+    },
+    "qtwx-mcp-3": {
+      "command": "node",
+      "args": [
+        "c:/Users/Admin/AppData/Roaming/Cursor/User/workspaceStorage/93f35907689405ee422a5506a8f810f1/QingTian.qingtian-v2/runtime/mcp-server/index.mjs"
+      ],
+      "env": {
+        "QINGTIAN_SESSION": "3",
+        "QINGTIAN_QUEUE_ROOT": "c:/Users/Admin/AppData/Roaming/Cursor/User/workspaceStorage/93f35907689405ee422a5506a8f810f1/QingTian.qingtian-v2/runtime/messages"
+      }
+    }
+  }
+}
