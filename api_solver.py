@@ -7,6 +7,9 @@ import random
 import logging
 import asyncio
 import argparse
+from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
+
 from quart import Quart, request, jsonify
 from patchright.async_api import async_playwright
 
@@ -98,11 +101,125 @@ class TurnstileAPIServer:
         self.thread_count = thread
         self.proxy_support = proxy_support
         self.browser_pool = asyncio.Queue()
-        self.browser_args = []
+        self.browser_args = ["--disable-blink-features=AutomationControlled"]
         if useragent:
             self.browser_args.append(f"--user-agent={useragent}")
 
         self._setup_routes()
+
+    @staticmethod
+    def _normalize_page_url(url: str) -> str:
+        url = (url or "").strip()
+        if not url:
+            return url
+        if not url.startswith(("http://", "https://")):
+            url = "https://" + url
+        return url
+
+    def _browser_context_options(self, proxy: Optional[Dict[str, str]]) -> Dict[str, Any]:
+        opts: Dict[str, Any] = {
+            "viewport": {"width": 1920, "height": 1080},
+            "screen": {"width": 1920, "height": 1080},
+            "locale": "en-US",
+            "timezone_id": "America/New_York",
+            "color_scheme": "light",
+            "device_scale_factor": 1,
+            "has_touch": False,
+            "is_mobile": False,
+        }
+        if self.useragent:
+            opts["user_agent"] = self.useragent
+        if proxy:
+            opts["proxy"] = proxy
+        return opts
+
+    @staticmethod
+    async def _try_click_turnstile(page) -> None:
+        iframe_selectors = (
+            "iframe[src*='challenges.cloudflare.com']",
+            "iframe[src*='turnstile']",
+            "iframe[title*='Cloudflare']",
+        )
+        for sel in iframe_selectors:
+            loc = page.locator(sel).first
+            try:
+                if await loc.count() == 0:
+                    continue
+                await loc.wait_for(state="visible", timeout=5000)
+                box = await loc.bounding_box()
+                if box:
+                    await page.mouse.click(
+                        box["x"] + min(box["width"] / 2, 40),
+                        box["y"] + min(box["height"] / 2, 35),
+                    )
+                    return
+            except Exception:
+                continue
+        for sel in ("div.cf-turnstile", "[data-sitekey]", ".cf-turnstile"):
+            try:
+                await page.locator(sel).first.click(timeout=1200)
+                return
+            except Exception:
+                continue
+
+    @staticmethod
+    def _format_cookie_header(cookies: List[Dict[str, Any]]) -> str:
+        if not cookies:
+            return ""
+        return "; ".join(f"{c['name']}={c['value']}" for c in cookies if c.get("name"))
+
+    @staticmethod
+    def _has_d_and_locl(cookies: List[Dict[str, Any]]) -> bool:
+        names = {c.get("name") for c in cookies}
+        return "d" in names and "locl" in names
+
+    @staticmethod
+    def _d_locl_cookie_header(cookies: List[Dict[str, Any]]) -> str:
+        by = {c.get("name"): c.get("value", "") for c in cookies if c.get("name") in ("d", "locl")}
+        parts = []
+        if "d" in by:
+            parts.append(f"d={by['d']}")
+        if "locl" in by:
+            parts.append(f"locl={by['locl']}")
+        return "; ".join(parts)
+
+    @staticmethod
+    def _attach_http_capture(
+        target: Dict[str, Any],
+        last_document_request_headers: Dict[str, str],
+        post_data_holder: List[Optional[str]],
+    ) -> None:
+        """`headers` = exact request headers from the last document navigation (e.g. after refresh)."""
+        target["request_body"] = post_data_holder[0]
+        target["headers"] = dict(last_document_request_headers)
+
+    @staticmethod
+    async def _read_turnstile_token(page) -> str:
+        selectors = (
+            '[name="cf-turnstile-response"]',
+            "textarea[name='cf-turnstile-response']",
+            "input[name='cf-turnstile-response']",
+        )
+        for sel in selectors:
+            try:
+                loc = page.locator(sel).first
+                if await loc.count() == 0:
+                    continue
+                v = await loc.input_value(timeout=1500)
+                if v:
+                    return v
+            except Exception:
+                continue
+        try:
+            v = await page.evaluate(
+                """() => {
+                    const el = document.querySelector('[name="cf-turnstile-response"]');
+                    return el && el.value ? el.value : '';
+                }"""
+            )
+            return v or ""
+        except Exception:
+            return ""
 
     @staticmethod
     def _load_results():
@@ -128,7 +245,6 @@ class TurnstileAPIServer:
         self.app.before_serving(self._startup)
         self.app.route('/turnstile', methods=['GET'])(self.process_turnstile)
         self.app.route('/result', methods=['GET'])(self.get_result)
-        self.app.route('/readme')(self.index)
 
     async def _startup(self) -> None:
         """Initialize the browser and page pool on startup."""
@@ -168,93 +284,294 @@ class TurnstileAPIServer:
         logger.success(f"Browser pool initialized with {self.browser_pool.qsize()} browsers")
 
 
-    async def _solve_turnstile(self, task_id: str, url: str, sitekey: str, action: str = None, cdata: str = None):
-        """Solve the Turnstile challenge."""
-        proxy = None
+    async def _solve_turnstile(
+        self,
+        task_id: str,
+        url: str,
+        sitekey: Optional[str] = None,
+        action: str = None,
+        cdata: str = None,
+        solve_timeout: Optional[float] = None,
+    ):
+        """Load the real page, pass Turnstile like a normal browser, then return token + cookies."""
+        proxy_url = None
+        proxy_cfg: Optional[Dict[str, str]] = None
 
         index, browser = await self.browser_pool.get()
 
         if self.proxy_support:
             proxy_file_path = os.path.join(os.getcwd(), "proxies.txt")
-
             with open(proxy_file_path) as proxy_file:
                 proxies = [line.strip() for line in proxy_file if line.strip()]
-
-            proxy = random.choice(proxies) if proxies else None
-
-            if proxy:
-                parts = proxy.split(':')
+            proxy_url = random.choice(proxies) if proxies else None
+            if proxy_url:
+                parts = proxy_url.split(":")
                 if len(parts) == 3:
-                    context = await browser.new_context(proxy={"server": f"{proxy}"})
+                    proxy_cfg = {"server": f"{proxy_url}"}
                 elif len(parts) == 5:
                     proxy_scheme, proxy_ip, proxy_port, proxy_user, proxy_pass = parts
-                    context = await browser.new_context(proxy={"server": f"{proxy_scheme}://{proxy_ip}:{proxy_port}", "username": proxy_user, "password": proxy_pass})
+                    proxy_cfg = {
+                        "server": f"{proxy_scheme}://{proxy_ip}:{proxy_port}",
+                        "username": proxy_user,
+                        "password": proxy_pass,
+                    }
                 else:
+                    await self.browser_pool.put((index, browser))
                     raise ValueError("Invalid proxy format")
-            else:
-                context = await browser.new_context()
-        else:
-            context = await browser.new_context()
-
-        page = await context.new_page()
 
         start_time = time.time()
+        context = None
 
-        try:
-            if self.debug:
-                logger.debug(f"Browser {index}: Starting Turnstile solve for URL: {url} with Sitekey: {sitekey} | Proxy: {proxy}")
-                logger.debug(f"Browser {index}: Setting up page data and route")
+        async def _run_solve():
+            nonlocal context
+            context = await browser.new_context(**self._browser_context_options(proxy_cfg))
+            page = await context.new_page()
+            set_cookie_headers: List[str] = []
+            last_document_request_headers: Dict[str, str] = {}
+            last_document_response_headers: Dict[str, str] = {}
+            last_document_request_body: List[Optional[str]] = [None]
 
-            url_with_slash = url + "/" if not url.endswith("/") else url
-            turnstile_div = f'<div class="cf-turnstile" style="background: white;" data-sitekey="{sitekey}"' + (f' data-action="{action}"' if action else '') + (f' data-cdata="{cdata}"' if cdata else '') + '></div>'
-            page_data = self.HTML_TEMPLATE.replace("<!-- cf turnstile -->", turnstile_div)
-
-            await page.route(url_with_slash, lambda route: route.fulfill(body=page_data, status=200))
-            await page.goto(url_with_slash)
-
-            if self.debug:
-                logger.debug(f"Browser {index}: Setting up Turnstile widget dimensions")
-
-            await page.eval_on_selector("//div[@class='cf-turnstile']", "el => el.style.width = '70px'")
-
-            if self.debug:
-                logger.debug(f"Browser {index}: Starting Turnstile response retrieval loop")
-
-            for _ in range(10):
+            def _on_response(response):
                 try:
-                    turnstile_check = await page.input_value("[name=cf-turnstile-response]", timeout=2000)
-                    if turnstile_check == "":
-                        if self.debug:
-                            logger.debug(f"Browser {index}: Attempt {_} - No Turnstile response yet")
-                        
-                        await page.locator("//div[@class='cf-turnstile']").click(timeout=1000)
-                        await asyncio.sleep(0.5)
-                    else:
-                        elapsed_time = round(time.time() - start_time, 3)
-
-                        logger.success(f"Browser {index}: Successfully solved captcha - {COLORS.get('MAGENTA')}{turnstile_check[:10]}{COLORS.get('RESET')} in {COLORS.get('GREEN')}{elapsed_time}{COLORS.get('RESET')} Seconds")
-
-                        self.results[task_id] = {"value": turnstile_check, "elapsed_time": elapsed_time}
-                        self._save_results()
-                        break
-                except:
+                    h = response.headers
+                    sc = h.get("set-cookie") or h.get("Set-Cookie")
+                    if sc and sc not in set_cookie_headers:
+                        set_cookie_headers.append(sc)
+                    req = response.request
+                    if req.resource_type == "document":
+                        last_document_request_headers.clear()
+                        last_document_request_headers.update(dict(req.headers))
+                        last_document_response_headers.clear()
+                        last_document_response_headers.update(dict(h))
+                        try:
+                            last_document_request_body[0] = req.post_data
+                        except Exception:
+                            last_document_request_body[0] = None
+                except Exception:
                     pass
 
-            if self.results.get(task_id) == "CAPTCHA_NOT_READY":
+            page.on("response", _on_response)
+
+            page_url = self._normalize_page_url(url)
+
+            try:
+                if self.debug:
+                    logger.debug(
+                        f"Browser {index}: Real page solve | url={page_url} sitekey={sitekey!r} proxy={proxy_url!r}"
+                    )
+
+                await page.goto(page_url, wait_until="domcontentloaded", timeout=120000)
+                await page.wait_for_load_state("domcontentloaded")
+
+                if sitekey:
+                    try:
+                        await page.wait_for_selector(
+                            f'div[data-sitekey="{sitekey}"], iframe[src*="challenges.cloudflare"]',
+                            timeout=45000,
+                        )
+                    except Exception:
+                        if self.debug:
+                            logger.debug(f"Browser {index}: Sitekey/iframe wait timed out, continuing")
+
+                await asyncio.sleep(1.5)
+                await self._try_click_turnstile(page)
+
+                init_host = (urlparse(page_url).hostname or "").lower()
+
+                def _cookie_matches(domains: set, domain: str) -> bool:
+                    d = (domain or "").lstrip(".").lower()
+                    if not d:
+                        return False
+                    return any(h == d or h.endswith("." + d) for h in domains)
+
+                async def _filtered_jar() -> List[Dict[str, Any]]:
+                    fh = (urlparse(page.url).hostname or "").lower()
+                    hs = {h for h in (fh, init_host) if h}
+                    raw = await context.cookies()
+                    if not hs:
+                        return list(raw)
+                    return [c for c in raw if _cookie_matches(hs, c.get("domain", ""))]
+
+                turnstile_check = ""
+                session_via_dl = False
+                for attempt in range(200):
+                    jar = await _filtered_jar()
+
+                    if self._has_d_and_locl(jar):
+                        session_via_dl = True
+                        if self.debug:
+                            logger.debug(f"Browser {index}: d + locl detected (attempt {attempt}), capturing now")
+                        break
+
+                    turnstile_check = await self._read_turnstile_token(page)
+                    if turnstile_check:
+                        break
+
+                    if self.debug and attempt % 25 == 0:
+                        logger.debug(f"Browser {index}: Waiting for d/locl or Turnstile token (attempt {attempt})")
+
+                    if attempt % 4 == 0:
+                        await self._try_click_turnstile(page)
+                    await asyncio.sleep(0.35)
+
+                if not turnstile_check and not session_via_dl:
+                    elapsed_time = round(time.time() - start_time, 3)
+                    try:
+                        await page.wait_for_load_state("networkidle", timeout=15000)
+                    except Exception:
+                        pass
+                    await asyncio.sleep(1.0)
+
+                    sess: Dict[str, Any] = {
+                        "value": "CAPTCHA_FAIL",
+                        "elapsed_time": elapsed_time,
+                        "url_final": page.url,
+                    }
+                    try:
+                        cookies = await context.cookies()
+                        final_host = (urlparse(page.url).hostname or "").lower()
+                        init_host_cookie = (urlparse(page_url).hostname or "").lower()
+                        hosts = {h for h in (final_host, init_host_cookie) if h}
+
+                        def _cookie_matches_inner(domains: set, domain: str) -> bool:
+                            d = (domain or "").lstrip(".").lower()
+                            if not d:
+                                return False
+                            return any(h == d or h.endswith("." + d) for h in domains)
+
+                        if hosts:
+                            cookies = [c for c in cookies if _cookie_matches_inner(hosts, c.get("domain", ""))]
+                        if self._has_d_and_locl(cookies):
+                            try:
+                                await page.reload(wait_until="domcontentloaded", timeout=90000)
+                            except Exception:
+                                pass
+                            await asyncio.sleep(0.35)
+                            cookies = await context.cookies()
+                            if hosts:
+                                cookies = [c for c in cookies if _cookie_matches_inner(hosts, c.get("domain", ""))]
+                        ch = self._format_cookie_header(cookies)
+                        req_snap = dict(last_document_request_headers)
+                        if ch and "cookie" not in {k.lower() for k in req_snap}:
+                            req_snap["cookie"] = ch
+                        sess["cookies"] = cookies
+                        sess["cookie_header"] = ch
+                        sess["d_locl_cookie_header"] = self._d_locl_cookie_header(cookies)
+                        sess["request_headers"] = req_snap
+                        sess["response_headers"] = dict(last_document_response_headers)
+                        sess["set_cookie_headers"] = list(set_cookie_headers)
+                        self._attach_http_capture(sess, dict(last_document_request_headers), last_document_request_body)
+                    except Exception:
+                        pass
+
+                    if sess.get("cookie_header"):
+                        sess["value"] = ""
+                        sess["turnstile_token"] = None
+                        sess["note"] = (
+                            "No cf-turnstile-response field found; session cookies and request headers were captured "
+                            "(e.g. Cloudflare clearance / site cookies only)."
+                        )
+                        logger.success(
+                            f"Browser {index}: Session cookies captured (no Turnstile widget token) in "
+                            f"{COLORS.get('GREEN')}{elapsed_time}{COLORS.get('RESET')}s — {page.url}"
+                        )
+                    elif self.debug:
+                        logger.error(
+                            f"Browser {index}: No Turnstile token or cookies in {COLORS.get('RED')}{elapsed_time}{COLORS.get('RESET')}s"
+                        )
+
+                    self.results[task_id] = sess
+                    self._save_results()
+                else:
+                    if session_via_dl and not turnstile_check:
+                        await asyncio.sleep(0.3)
+                        try:
+                            await page.reload(wait_until="domcontentloaded", timeout=90000)
+                        except Exception:
+                            pass
+                        await asyncio.sleep(0.35)
+                    else:
+                        try:
+                            await page.wait_for_load_state("networkidle", timeout=20000)
+                        except Exception:
+                            pass
+                        await asyncio.sleep(2.5)
+
+                    cookies = await _filtered_jar()
+                    cookie_header = self._format_cookie_header(cookies)
+                    elapsed_time = round(time.time() - start_time, 3)
+
+                    if turnstile_check:
+                        logger.success(
+                            f"Browser {index}: Solved — token {COLORS.get('MAGENTA')}{turnstile_check[:12]}…{COLORS.get('RESET')} in "
+                            f"{COLORS.get('GREEN')}{elapsed_time}{COLORS.get('RESET')}s | final URL {page.url}"
+                        )
+                    else:
+                        logger.success(
+                            f"Browser {index}: d + locl captured in {COLORS.get('GREEN')}{elapsed_time}{COLORS.get('RESET')}s — {page.url}"
+                        )
+
+                    req_hdrs = dict(last_document_request_headers)
+                    if cookie_header and "cookie" not in {k.lower() for k in req_hdrs}:
+                        req_hdrs["cookie"] = cookie_header
+
+                    payload: Dict[str, Any] = {
+                        "value": turnstile_check or "",
+                        "elapsed_time": elapsed_time,
+                        "url_initial": page_url,
+                        "url_final": page.url,
+                        "cookies": cookies,
+                        "cookie_header": cookie_header,
+                        "d_locl_cookie_header": self._d_locl_cookie_header(cookies),
+                        "request_headers": req_hdrs,
+                        "response_headers": dict(last_document_response_headers),
+                        "set_cookie_headers": list(set_cookie_headers),
+                    }
+                    if session_via_dl and not turnstile_check:
+                        payload["turnstile_token"] = None
+                        payload["note"] = (
+                            "Session cookies `d` and `locl` were detected in the jar; headers captured immediately."
+                        )
+
+                    self._attach_http_capture(payload, dict(last_document_request_headers), last_document_request_body)
+
+                    self.results[task_id] = payload
+                    self._save_results()
+
+            except Exception as e:
                 elapsed_time = round(time.time() - start_time, 3)
                 self.results[task_id] = {"value": "CAPTCHA_FAIL", "elapsed_time": elapsed_time}
                 if self.debug:
-                    logger.error(f"Browser {index}: Error solving Turnstile in {COLORS.get('RED')}{elapsed_time}{COLORS.get('RESET')} Seconds")
-        except Exception as e:
+                    logger.error(f"Browser {index}: Error solving Turnstile: {str(e)}")
+
+        try:
+            if solve_timeout is not None:
+                await asyncio.wait_for(_run_solve(), timeout=solve_timeout)
+            else:
+                await _run_solve()
+        except asyncio.TimeoutError:
             elapsed_time = round(time.time() - start_time, 3)
-            self.results[task_id] = {"value": "CAPTCHA_FAIL", "elapsed_time": elapsed_time}
+            self.results[task_id] = {
+                "value": "CAPTCHA_FAIL",
+                "elapsed_time": elapsed_time,
+                "reason": "solve_timeout",
+                "timeout_seconds": solve_timeout,
+                "message": f"Solve exceeded time limit of {solve_timeout} second(s).",
+            }
+            self._save_results()
             if self.debug:
-                logger.error(f"Browser {index}: Error solving Turnstile: {str(e)}")
+                logger.error(
+                    f"Browser {index}: Solve timeout after {COLORS.get('RED')}{elapsed_time}{COLORS.get('RESET')}s "
+                    f"(limit {solve_timeout}s)"
+                )
         finally:
             if self.debug:
                 logger.debug(f"Browser {index}: Clearing page state")
-
-            await context.close()
+            if context is not None:
+                try:
+                    await context.close()
+                except Exception:
+                    pass
             await self.browser_pool.put((index, browser))
 
     async def process_turnstile(self):
@@ -263,18 +580,38 @@ class TurnstileAPIServer:
         sitekey = request.args.get('sitekey')
         action = request.args.get('action')
         cdata = request.args.get('cdata')
+        timeout_raw = request.args.get('timeout')
 
-        if not url or not sitekey:
+        if not url:
             return jsonify({
                 "status": "error",
-                "error": "Both 'url' and 'sitekey' are required"
+                "error": "'url' is required (full page with Turnstile is loaded in a real browser)"
             }), 400
+
+        solve_timeout = None
+        if timeout_raw is not None and str(timeout_raw).strip() != "":
+            try:
+                solve_timeout = float(timeout_raw)
+            except (TypeError, ValueError):
+                return jsonify({"status": "error", "error": "Invalid 'timeout': expected a number of seconds"}), 400
+            if solve_timeout <= 0:
+                return jsonify({"status": "error", "error": "'timeout' must be greater than 0"}), 400
+            if solve_timeout > 86400:
+                solve_timeout = 86400.0
 
         task_id = str(uuid.uuid4())
         self.results[task_id] = "CAPTCHA_NOT_READY"
 
         try:
-            asyncio.create_task(self._solve_turnstile(task_id=task_id, url=url, sitekey=sitekey, action=action, cdata=cdata))
+            self.app.add_background_task(
+                self._solve_turnstile,
+                task_id,
+                url,
+                sitekey or None,
+                action,
+                cdata,
+                solve_timeout,
+            )
 
             if self.debug:
                 logger.debug(f"Request completed with taskid {task_id}.")
@@ -296,63 +633,30 @@ class TurnstileAPIServer:
         result = self.results[task_id]
         status_code = 200
 
-        if "CAPTCHA_FAIL" in result:
+        if isinstance(result, dict) and result.get("value") == "CAPTCHA_FAIL":
             status_code = 422
 
         return result, status_code
-
-    @staticmethod
-    async def index():
-        """Serve the API documentation page."""
-        return """
-            <!DOCTYPE html>
-            <html lang="en">
-            <head>
-                <meta charset="UTF-8">
-                <meta name="viewport" content="width=device-width, initial-scale=1.0">
-                <title>Turnstile Solver API</title>
-                <script src="https://cdn.tailwindcss.com"></script>
-            </head>
-            <body class="bg-gray-900 text-gray-200 min-h-screen flex items-center justify-center">
-                <div class="bg-gray-800 p-8 rounded-lg shadow-md max-w-2xl w-full border border-red-500">
-                    <h1 class="text-3xl font-bold mb-6 text-center text-red-500">Welcome to Turnstile Solver API</h1>
-
-                    <p class="mb-4 text-gray-300">To use the turnstile service, send a GET request to 
-                       <code class="bg-red-700 text-white px-2 py-1 rounded">/turnstile</code> with the following query parameters:</p>
-
-                    <ul class="list-disc pl-6 mb-6 text-gray-300">
-                        <li><strong>url</strong>: The URL where Turnstile is to be validated</li>
-                        <li><strong>sitekey</strong>: The site key for Turnstile</li>
-                    </ul>
-
-                    <div class="bg-gray-700 p-4 rounded-lg mb-6 border border-red-500">
-                        <p class="font-semibold mb-2 text-red-400">Example usage:</p>
-                        <code class="text-sm break-all text-red-300">/turnstile?url=https://example.com&sitekey=sitekey</code>
-                    </div>
-
-                    <div class="bg-red-900 border-l-4 border-red-600 p-4 mb-6">
-                        <p class="text-red-200 font-semibold">This project is inspired by 
-                           <a href="https://github.com/Body-Alhoha/turnaround" class="text-red-300 hover:underline">Turnaround</a> 
-                           and is currently maintained by 
-                           <a href="https://github.com/Theyka" class="text-red-300 hover:underline">Theyka</a> 
-                           and <a href="https://github.com/sexfrance" class="text-red-300 hover:underline">Sexfrance</a>.</p>
-                    </div>
-                </div>
-            </body>
-            </html>
-        """
 
 
 def parse_args():
     """Parse command-line arguments."""
     parser = argparse.ArgumentParser(description="Turnstile API Server")
 
-    parser.add_argument('--headless', type=bool, default=False, help='Run the browser in headless mode, without opening a graphical interface. This option requires the --useragent argument to be set (default: False)')
+    parser.add_argument(
+        '--headless',
+        action='store_true',
+        help='Run the browser headless (requires --useragent unless using camoufox)',
+    )
     parser.add_argument('--useragent', type=str, default=None, help='Specify a custom User-Agent string for the browser. If not provided, the default User-Agent is used')
-    parser.add_argument('--debug', type=bool, default=False, help='Enable or disable debug mode for additional logging and troubleshooting information (default: False)')
+    parser.add_argument(
+        '--debug',
+        action='store_true',
+        help='Verbose solver logging (browser steps, waits, errors)',
+    )
     parser.add_argument('--browser_type', type=str, default='chromium', help='Specify the browser type for the solver. Supported options: chromium, chrome, msedge, camoufox (default: chromium)')
     parser.add_argument('--thread', type=int, default=1, help='Set the number of browser threads to use for multi-threaded mode. Increasing this will speed up execution but requires more resources (default: 1)')
-    parser.add_argument('--proxy', type=bool, default=False, help='Enable proxy support for the solver (Default: False)')
+    parser.add_argument('--proxy', action='store_true', help='Pick a random proxy from proxies.txt for each solve')
     parser.add_argument('--host', type=str, default='127.0.0.1', help='Specify the IP address where the API solver runs. (Default: 127.0.0.1)')
     parser.add_argument('--port', type=str, default='5000', help='Set the port for the API solver to listen on. (Default: 5000)')
     return parser.parse_args()
