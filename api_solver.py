@@ -283,6 +283,132 @@ class TurnstileAPIServer:
 
         logger.success(f"Browser pool initialized with {self.browser_pool.qsize()} browsers")
 
+    async def _solve_turnstile_embedded(
+        self,
+        task_id: str,
+        url: str,
+        sitekey: str,
+        action: Optional[str],
+        cdata: Optional[str],
+        solve_timeout: Optional[float],
+    ) -> None:
+        """Serve local HTML with an embedded Turnstile widget (legacy flow when ``sitekey`` is provided)."""
+        proxy_url = None
+        proxy_cfg: Optional[Dict[str, str]] = None
+
+        index, browser = await self.browser_pool.get()
+
+        if self.proxy_support:
+            proxy_file_path = os.path.join(os.getcwd(), "proxies.txt")
+            with open(proxy_file_path) as proxy_file:
+                proxies = [line.strip() for line in proxy_file if line.strip()]
+            proxy_url = random.choice(proxies) if proxies else None
+            if proxy_url:
+                parts = proxy_url.split(":")
+                if len(parts) == 3:
+                    proxy_cfg = {"server": f"{proxy_url}"}
+                elif len(parts) == 5:
+                    proxy_scheme, proxy_ip, proxy_port, proxy_user, proxy_pass = parts
+                    proxy_cfg = {
+                        "server": f"{proxy_scheme}://{proxy_ip}:{proxy_port}",
+                        "username": proxy_user,
+                        "password": proxy_pass,
+                    }
+                else:
+                    await self.browser_pool.put((index, browser))
+                    raise ValueError("Invalid proxy format")
+
+        start_time = time.time()
+        context = None
+
+        async def _run_embedded() -> None:
+            nonlocal context
+            context = await browser.new_context(**self._browser_context_options(proxy_cfg))
+            page = await context.new_page()
+            base = self._normalize_page_url(url)
+            url_with_slash = base + "/" if not base.endswith("/") else base
+            turnstile_div = (
+                '<div class="cf-turnstile" style="background: white;" data-sitekey="' + sitekey + '"'
+                + (f' data-action="{action}"' if action else "")
+                + (f' data-cdata="{cdata}"' if cdata else "")
+                + "></div>"
+            )
+            page_data = self.HTML_TEMPLATE.replace("<!-- cf turnstile -->", turnstile_div)
+
+            async def fulfill_route(route) -> None:
+                await route.fulfill(body=page_data, status=200)
+
+            await page.route(url_with_slash, fulfill_route)
+            if self.debug:
+                logger.debug(
+                    f"Browser {index}: Embedded solve | url={url_with_slash!r} sitekey={sitekey!r} proxy={proxy_url!r}"
+                )
+
+            await page.goto(url_with_slash, wait_until="domcontentloaded", timeout=120000)
+
+            await page.eval_on_selector("//div[@class='cf-turnstile']", "el => el.style.width = '70px'")
+
+            for attempt in range(10):
+                try:
+                    turnstile_check = await page.input_value("[name=cf-turnstile-response]", timeout=2000)
+                    if turnstile_check == "":
+                        if self.debug:
+                            logger.debug(f"Browser {index}: Embedded attempt {attempt} - no response yet")
+                        await page.locator("//div[@class='cf-turnstile']").click(timeout=1000)
+                        await asyncio.sleep(0.5)
+                    else:
+                        elapsed_time = round(time.time() - start_time, 3)
+                        logger.success(
+                            f"Browser {index}: Solved (embedded) — "
+                            f"{COLORS.get('MAGENTA')}{turnstile_check[:10]}…{COLORS.get('RESET')} in "
+                            f"{COLORS.get('GREEN')}{elapsed_time}{COLORS.get('RESET')}s"
+                        )
+                        self.results[task_id] = {"value": turnstile_check, "elapsed_time": elapsed_time}
+                        self._save_results()
+                        return
+                except Exception:
+                    pass
+
+            if self.results.get(task_id) == "CAPTCHA_NOT_READY":
+                elapsed_time = round(time.time() - start_time, 3)
+                self.results[task_id] = {"value": "CAPTCHA_FAIL", "elapsed_time": elapsed_time}
+                self._save_results()
+                if self.debug:
+                    logger.error(
+                        f"Browser {index}: Embedded Turnstile failed in "
+                        f"{COLORS.get('RED')}{elapsed_time}{COLORS.get('RESET')}s"
+                    )
+
+        try:
+            if solve_timeout is not None:
+                await asyncio.wait_for(_run_embedded(), timeout=solve_timeout)
+            else:
+                await _run_embedded()
+        except asyncio.TimeoutError:
+            elapsed_time = round(time.time() - start_time, 3)
+            self.results[task_id] = {
+                "value": "CAPTCHA_FAIL",
+                "elapsed_time": elapsed_time,
+                "reason": "solve_timeout",
+                "timeout_seconds": solve_timeout,
+                "message": f"Solve exceeded time limit of {solve_timeout} second(s).",
+            }
+            self._save_results()
+            if self.debug:
+                logger.error(f"Browser {index}: Embedded solve timeout (limit {solve_timeout}s)")
+        except Exception as e:
+            elapsed_time = round(time.time() - start_time, 3)
+            self.results[task_id] = {"value": "CAPTCHA_FAIL", "elapsed_time": elapsed_time}
+            self._save_results()
+            if self.debug:
+                logger.error(f"Browser {index}: Embedded solve error: {str(e)}")
+        finally:
+            if context is not None:
+                try:
+                    await context.close()
+                except Exception:
+                    pass
+            await self.browser_pool.put((index, browser))
 
     async def _solve_turnstile(
         self,
@@ -294,6 +420,12 @@ class TurnstileAPIServer:
         solve_timeout: Optional[float] = None,
     ):
         """Load the real page, pass Turnstile like a normal browser, then return token + cookies."""
+        if sitekey:
+            await self._solve_turnstile_embedded(
+                task_id, url, sitekey, action, cdata, solve_timeout
+            )
+            return
+
         proxy_url = None
         proxy_cfg: Optional[Dict[str, str]] = None
 
@@ -362,16 +494,6 @@ class TurnstileAPIServer:
 
                 await page.goto(page_url, wait_until="domcontentloaded", timeout=120000)
                 await page.wait_for_load_state("domcontentloaded")
-
-                if sitekey:
-                    try:
-                        await page.wait_for_selector(
-                            f'div[data-sitekey="{sitekey}"], iframe[src*="challenges.cloudflare"]',
-                            timeout=45000,
-                        )
-                    except Exception:
-                        if self.debug:
-                            logger.debug(f"Browser {index}: Sitekey/iframe wait timed out, continuing")
 
                 await asyncio.sleep(1.5)
                 await self._try_click_turnstile(page)
@@ -577,7 +699,8 @@ class TurnstileAPIServer:
     async def process_turnstile(self):
         """Handle the /turnstile endpoint requests."""
         url = request.args.get('url')
-        sitekey = request.args.get('sitekey')
+        sitekey_raw = request.args.get('sitekey')
+        sitekey = (sitekey_raw or "").strip() or None
         action = request.args.get('action')
         cdata = request.args.get('cdata')
         timeout_raw = request.args.get('timeout')
@@ -585,7 +708,7 @@ class TurnstileAPIServer:
         if not url:
             return jsonify({
                 "status": "error",
-                "error": "'url' is required (full page with Turnstile is loaded in a real browser)"
+                "error": "'url' is required"
             }), 400
 
         solve_timeout = None
@@ -607,7 +730,7 @@ class TurnstileAPIServer:
                 self._solve_turnstile,
                 task_id,
                 url,
-                sitekey or None,
+                sitekey,
                 action,
                 cdata,
                 solve_timeout,
