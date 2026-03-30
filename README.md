@@ -149,6 +149,12 @@ docker run -d -p 3389:3389 -p 5000:5000 -e TZ=Asia/Baku --name turnstile_solver 
 | `sitekey`  | string  | The site key for the CAPTCHA to be solved. (e.g., `0x4AAAAAAA`) | Yes      |
 | `action`   | string  | Action to trigger during CAPTCHA solving, e.g., `login`            | No       |
 | `cdata`    | string  | Custom data that can be used for additional CAPTCHA parameters.    | No       |
+| `timeout`  | number  | Max solve time in seconds. | No |
+| `proxy`    | string  | Outbound proxy for this job (`http(s)://…`, `socks5:host:port`, or with auth — SOCKS+auth needs Firefox/camoufox, not Chrome). | No |
+| `reverse_proxy` | string | Worker base URL. Optional path suffix **`/SCHEMA`** (case-sensitive): strip it from the base and force **full** tails (`…/https://goplay.ml/`). Without **`/SCHEMA`**, default tails omit the scheme (`…/goplay.ml/`); override with `reverse_proxy_style=full` if needed. | No |
+| `reverse_proxy_style` | string | `host` (default) = tail is `hostname/path…` (no `https://` in path). `full` = tail includes scheme. Ignored when `reverse_proxy` ends with **`/SCHEMA`**. | No |
+
+**Environment:** Optional `ALLOWED_REVERSE_PROXY_HOSTS` — comma-separated hostnames allowed for `reverse_proxy` (e.g. `as.mykhcdn.workers.dev`). If unset, any host is allowed.
 
 #### Response:
 

@@ -8,7 +8,7 @@ import logging
 import asyncio
 import argparse
 from typing import Any, Dict, List, Optional
-from urllib.parse import urlparse
+from urllib.parse import urlparse, unquote, urlunparse
 
 from quart import Quart, request, jsonify
 from patchright.async_api import async_playwright
@@ -115,6 +115,187 @@ class TurnstileAPIServer:
         if not url.startswith(("http://", "https://")):
             url = "https://" + url
         return url
+
+    _REVERSE_PROXY_SCHEMA_MARKER = "/SCHEMA"
+
+    @staticmethod
+    def _normalize_reverse_proxy_base(raw: str) -> str:
+        """Strip trailing slash; ensure scheme (same as page URLs)."""
+        u = TurnstileAPIServer._normalize_page_url((raw or "").strip())
+        return u.rstrip("/")
+
+    @staticmethod
+    def _parse_reverse_proxy_param(raw: str) -> tuple[str, Optional[str]]:
+        """
+        Parse ``reverse_proxy`` query value.
+
+        Returns ``(base_url, forced_style)`` where ``forced_style`` is ``\"full\"`` if the path ended
+        with ``/SCHEMA`` (marker stripped from base; tail includes ``http(s)://...``). Otherwise
+        ``forced_style`` is ``None`` and callers use ``reverse_proxy_style`` (default ``host``: no
+        scheme in tail, e.g. ``…/goplay.ml/`` not ``…/https://goplay.ml/``).
+        """
+        u = TurnstileAPIServer._normalize_page_url((raw or "").strip())
+        p = urlparse(u)
+        path = p.path or ""
+        path_norm = path.rstrip("/")
+        if path_norm.endswith(TurnstileAPIServer._REVERSE_PROXY_SCHEMA_MARKER):
+            prefix = path_norm[: -len(TurnstileAPIServer._REVERSE_PROXY_SCHEMA_MARKER)].rstrip("/")
+            path_out = f"/{prefix}" if prefix else ""
+            base = urlunparse((p.scheme, p.netloc, path_out, "", "", "")).rstrip("/")
+            return base, "full"
+        return u.rstrip("/"), None
+
+    @staticmethod
+    def _build_reverse_proxied_url(absolute_url: str, base: str, style: str) -> str:
+        """Map an absolute http(s) URL to ``base/<tail>`` for worker-style reverse proxies."""
+        base = base.rstrip("/")
+        au = absolute_url or ""
+        if au == base or au.startswith(base + "/"):
+            return au
+        p = urlparse(au)
+        if p.scheme not in ("http", "https"):
+            return au
+        path_part = p.path if p.path else "/"
+        query = f"?{p.query}" if p.query else ""
+        fragment = f"#{p.fragment}" if p.fragment else ""
+        if style == "host":
+            tail = f"{p.netloc}{path_part}{query}{fragment}"
+        else:
+            tail = urlunparse((p.scheme, p.netloc, path_part, "", p.query, p.fragment))
+        return f"{base}/{tail}"
+
+    @staticmethod
+    def _reverse_proxy_allowed_hosts_env() -> Optional[frozenset]:
+        """If set, ``ALLOWED_REVERSE_PROXY_HOSTS`` is a comma-separated list of allowed proxy hostnames (lowercase)."""
+        raw = (os.environ.get("ALLOWED_REVERSE_PROXY_HOSTS") or "").strip()
+        if not raw:
+            return None
+        return frozenset(h.strip().lower() for h in raw.split(",") if h.strip())
+
+    def _assert_reverse_proxy_host_allowed(self, normalized_base: str) -> None:
+        allowed = self._reverse_proxy_allowed_hosts_env()
+        if not allowed:
+            return
+        host = (urlparse(normalized_base).hostname or "").lower()
+        if not host:
+            raise ValueError("reverse_proxy must include a host when ALLOWED_REVERSE_PROXY_HOSTS is set")
+        if host not in allowed:
+            raise ValueError(
+                f"reverse_proxy host '{host}' is not permitted. "
+                "Configure ALLOWED_REVERSE_PROXY_HOSTS (comma-separated hosts, e.g. as.mykhcdn.workers.dev)."
+            )
+
+    async def _reverse_proxy_route_handler(
+        self,
+        route,
+        base: str,
+        style: str,
+        browser_index: int,
+    ) -> None:
+        """Rewrite all http(s) document/subresource requests through ``base`` (WebSocket/data/blob unchanged)."""
+        req = route.request
+        u = req.url
+        if u.startswith(("data:", "blob:", "about:")) or u.startswith(("ws://", "wss://")):
+            await route.continue_()
+            return
+        if not (u.startswith("http://") or u.startswith("https://")):
+            await route.continue_()
+            return
+        nu = self._build_reverse_proxied_url(u, base, style)
+        if nu != u and self.debug:
+            logger.debug(
+                f"Browser {browser_index}: reverse_proxy [{req.resource_type}] "
+                f"{u[:160]}{'…' if len(u) > 160 else ''} -> {nu[:160]}{'…' if len(nu) > 160 else ''}"
+            )
+        await route.continue_(url=nu)
+
+    _PROXY_SCHEMES = frozenset(("http", "https", "socks5", "socks4"))
+
+    @staticmethod
+    def _parse_proxy_spec(spec: str) -> Dict[str, str]:
+        """Playwright ``proxy`` dict from a URL or compact ``scheme:host:port[:user:pass]`` string."""
+        s = (spec or "").strip()
+        if not s:
+            raise ValueError("Proxy spec is empty")
+        if "://" in s:
+            p = urlparse(s)
+            if not p.scheme or not p.hostname or not p.port:
+                raise ValueError("Proxy URL must include scheme, host, and port (e.g. socks5://127.0.0.1:1080)")
+            sch = p.scheme.lower()
+            if sch not in TurnstileAPIServer._PROXY_SCHEMES:
+                raise ValueError(f"Unsupported proxy scheme '{p.scheme}'; use http, https, socks5, or socks4")
+            host = p.hostname
+            port = int(p.port)
+            cfg: Dict[str, str] = {"server": f"{sch}://{host}:{port}"}
+            if p.username:
+                cfg["username"] = unquote(p.username)
+            if p.password:
+                cfg["password"] = unquote(p.password)
+            return cfg
+        parts = s.split(":")
+        if len(parts) == 3:
+            scheme, host, port_s = parts
+            scheme = scheme.lower()
+            if scheme not in TurnstileAPIServer._PROXY_SCHEMES:
+                raise ValueError(f"Unsupported proxy scheme '{scheme}'")
+            try:
+                int(port_s)
+            except ValueError as e:
+                raise ValueError("Proxy port must be numeric") from e
+            return {"server": f"{scheme}://{host}:{port_s}"}
+        if len(parts) == 5:
+            scheme, host, port_s, user, pwd = parts
+            scheme = scheme.lower()
+            if scheme not in TurnstileAPIServer._PROXY_SCHEMES:
+                raise ValueError(f"Unsupported proxy scheme '{scheme}'")
+            try:
+                int(port_s)
+            except ValueError as e:
+                raise ValueError("Proxy port must be numeric") from e
+            return {
+                "server": f"{scheme}://{host}:{port_s}",
+                "username": user,
+                "password": pwd,
+            }
+        raise ValueError(
+            "Invalid proxy format. Use: scheme://host:port, scheme://user:pass@host:port, "
+            "or scheme:host:port[:user:pass] (same rules as query parameter 'proxy')"
+        )
+
+    def _pick_proxy_for_solve(
+        self,
+        proxy_cfg_override: Optional[Dict[str, str]],
+    ) -> tuple[Optional[Dict[str, str]], Optional[str]]:
+        """Returns (playwright proxy dict, redacted label for logging). Query proxy wins over proxies.txt."""
+        if proxy_cfg_override is not None:
+            return proxy_cfg_override, proxy_cfg_override.get("server")
+        if not self.proxy_support:
+            return None, None
+        proxy_file_path = os.path.join(os.getcwd(), "proxies.txt")
+        with open(proxy_file_path) as proxy_file:
+            proxies = [line.strip() for line in proxy_file if line.strip()]
+        line = random.choice(proxies) if proxies else None
+        if not line:
+            return None, None
+        cfg = self._parse_proxy_spec(line)
+        return cfg, cfg.get("server")
+
+    def _assert_proxy_supported_by_browser(self, proxy: Optional[Dict[str, str]]) -> None:
+        """Chromium does not support SOCKS4/SOCKS5 proxy username/password (Patchright/Playwright)."""
+        if not proxy:
+            return
+        server = (proxy.get("server") or "").strip().lower()
+        has_user = bool((proxy.get("username") or "").strip())
+        has_pass = bool((proxy.get("password") or "").strip())
+        if not (has_user or has_pass):
+            return
+        if server.startswith("socks4://") or server.startswith("socks5://"):
+            if self.browser_type in ("chromium", "chrome", "msedge"):
+                raise ValueError(
+                    "Chromium (chromium/chrome/msedge) does not support SOCKS proxy authentication. "
+                    "Use SOCKS without credentials, an HTTP or HTTPS proxy with user:pass "
+                    "(e.g. http://user:pass@host:port), or --browser_type camoufox (Firefox)."
+                )
 
     def _browser_context_options(self, proxy: Optional[Dict[str, str]]) -> Dict[str, Any]:
         opts: Dict[str, Any] = {
@@ -291,32 +472,22 @@ class TurnstileAPIServer:
         action: Optional[str],
         cdata: Optional[str],
         solve_timeout: Optional[float],
+        proxy_cfg_override: Optional[Dict[str, str]] = None,
+        reverse_proxy_base: Optional[str] = None,
+        reverse_proxy_style: str = "host",
     ) -> None:
         """Serve local HTML with an embedded Turnstile widget (legacy flow when ``sitekey`` is provided)."""
-        proxy_url = None
-        proxy_cfg: Optional[Dict[str, str]] = None
-
         index, browser = await self.browser_pool.get()
 
-        if self.proxy_support:
-            proxy_file_path = os.path.join(os.getcwd(), "proxies.txt")
-            with open(proxy_file_path) as proxy_file:
-                proxies = [line.strip() for line in proxy_file if line.strip()]
-            proxy_url = random.choice(proxies) if proxies else None
-            if proxy_url:
-                parts = proxy_url.split(":")
-                if len(parts) == 3:
-                    proxy_cfg = {"server": f"{proxy_url}"}
-                elif len(parts) == 5:
-                    proxy_scheme, proxy_ip, proxy_port, proxy_user, proxy_pass = parts
-                    proxy_cfg = {
-                        "server": f"{proxy_scheme}://{proxy_ip}:{proxy_port}",
-                        "username": proxy_user,
-                        "password": proxy_pass,
-                    }
-                else:
-                    await self.browser_pool.put((index, browser))
-                    raise ValueError("Invalid proxy format")
+        try:
+            proxy_cfg, proxy_label = self._pick_proxy_for_solve(proxy_cfg_override)
+            self._assert_proxy_supported_by_browser(proxy_cfg)
+        except ValueError:
+            await self.browser_pool.put((index, browser))
+            raise
+
+        rev_base = reverse_proxy_base.rstrip("/") if reverse_proxy_base else None
+        rev_style = reverse_proxy_style if reverse_proxy_style in ("full", "host") else "host"
 
         start_time = time.time()
         context = None
@@ -335,13 +506,27 @@ class TurnstileAPIServer:
             )
             page_data = self.HTML_TEMPLATE.replace("<!-- cf turnstile -->", turnstile_div)
 
-            async def fulfill_route(route) -> None:
-                await route.fulfill(body=page_data, status=200)
+            async def _all_embedded_routes(route) -> None:
+                req = route.request
+                u = req.url
+                doc_key = u.split("#")[0]
+                slug_key = url_with_slash.split("#")[0]
+                if doc_key.rstrip("/") == slug_key.rstrip("/") or doc_key.startswith(url_with_slash + "?"):
+                    await route.fulfill(
+                        body=page_data,
+                        status=200,
+                        headers={"content-type": "text/html; charset=utf-8"},
+                    )
+                    return
+                if rev_base:
+                    await self._reverse_proxy_route_handler(route, rev_base, rev_style, index)
+                    return
+                await route.continue_()
 
-            await page.route(url_with_slash, fulfill_route)
+            await page.route("**/*", _all_embedded_routes)
             if self.debug:
                 logger.debug(
-                    f"Browser {index}: Embedded solve | url={url_with_slash!r} sitekey={sitekey!r} proxy={proxy_url!r}"
+                    f"Browser {index}: Embedded solve | url={url_with_slash!r} sitekey={sitekey!r} proxy={proxy_label!r}"
                 )
 
             await page.goto(url_with_slash, wait_until="domcontentloaded", timeout=120000)
@@ -415,46 +600,50 @@ class TurnstileAPIServer:
         action: str = None,
         cdata: str = None,
         solve_timeout: Optional[float] = None,
+        proxy_cfg_override: Optional[Dict[str, str]] = None,
+        reverse_proxy_base: Optional[str] = None,
+        reverse_proxy_style: str = "host",
     ):
         """Load the real page, pass Turnstile like a normal browser, then return token + cookies."""
         if sitekey:
             await self._solve_turnstile_embedded(
-                task_id, url, sitekey, action, cdata, solve_timeout
+                task_id,
+                url,
+                sitekey,
+                action,
+                cdata,
+                solve_timeout,
+                proxy_cfg_override,
+                reverse_proxy_base,
+                reverse_proxy_style,
             )
             return
 
-        proxy_url = None
-        proxy_cfg: Optional[Dict[str, str]] = None
-
         index, browser = await self.browser_pool.get()
 
-        if self.proxy_support:
-            proxy_file_path = os.path.join(os.getcwd(), "proxies.txt")
-            with open(proxy_file_path) as proxy_file:
-                proxies = [line.strip() for line in proxy_file if line.strip()]
-            proxy_url = random.choice(proxies) if proxies else None
-            if proxy_url:
-                parts = proxy_url.split(":")
-                if len(parts) == 3:
-                    proxy_cfg = {"server": f"{proxy_url}"}
-                elif len(parts) == 5:
-                    proxy_scheme, proxy_ip, proxy_port, proxy_user, proxy_pass = parts
-                    proxy_cfg = {
-                        "server": f"{proxy_scheme}://{proxy_ip}:{proxy_port}",
-                        "username": proxy_user,
-                        "password": proxy_pass,
-                    }
-                else:
-                    await self.browser_pool.put((index, browser))
-                    raise ValueError("Invalid proxy format")
+        try:
+            proxy_cfg, proxy_label = self._pick_proxy_for_solve(proxy_cfg_override)
+            self._assert_proxy_supported_by_browser(proxy_cfg)
+        except ValueError:
+            await self.browser_pool.put((index, browser))
+            raise
 
         start_time = time.time()
         context = None
+
+        rev_base = reverse_proxy_base.rstrip("/") if reverse_proxy_base else None
+        rev_style = reverse_proxy_style if reverse_proxy_style in ("full", "host") else "host"
 
         async def _run_solve():
             nonlocal context
             context = await browser.new_context(**self._browser_context_options(proxy_cfg))
             page = await context.new_page()
+            if rev_base:
+
+                async def _rp_route(route) -> None:
+                    await self._reverse_proxy_route_handler(route, rev_base, rev_style, index)
+
+                await page.route("**/*", _rp_route)
             set_cookie_headers: List[str] = []
             last_document_request_headers: Dict[str, str] = {}
             last_document_response_headers: Dict[str, str] = {}
@@ -486,7 +675,7 @@ class TurnstileAPIServer:
             try:
                 if self.debug:
                     logger.debug(
-                        f"Browser {index}: Real page solve | url={page_url} sitekey={sitekey!r} proxy={proxy_url!r}"
+                        f"Browser {index}: Real page solve | url={page_url} sitekey={sitekey!r} proxy={proxy_label!r}"
                     )
 
                 await page.goto(page_url, wait_until="domcontentloaded", timeout=120000)
@@ -699,6 +888,34 @@ class TurnstileAPIServer:
         action = request.args.get('action')
         cdata = request.args.get('cdata')
         timeout_raw = request.args.get('timeout')
+        proxy_raw = request.args.get("proxy")
+        proxy_cfg_override: Optional[Dict[str, str]] = None
+        if proxy_raw is not None and str(proxy_raw).strip():
+            try:
+                proxy_cfg_override = self._parse_proxy_spec(proxy_raw)
+                self._assert_proxy_supported_by_browser(proxy_cfg_override)
+            except ValueError as e:
+                return jsonify({"status": "error", "error": str(e)}), 400
+
+        reverse_proxy_raw = request.args.get("reverse_proxy")
+        reverse_proxy_style_raw = (request.args.get("reverse_proxy_style") or "host").strip().lower()
+        if reverse_proxy_style_raw not in ("full", "host"):
+            return jsonify({
+                "status": "error",
+                "error": "Invalid 'reverse_proxy_style': use 'full' or 'host'",
+            }), 400
+        reverse_proxy_base: Optional[str] = None
+        reverse_proxy_style_effective = reverse_proxy_style_raw
+        if reverse_proxy_raw is not None and str(reverse_proxy_raw).strip():
+            try:
+                reverse_proxy_base, forced_style = self._parse_reverse_proxy_param(
+                    str(reverse_proxy_raw).strip()
+                )
+                if forced_style is not None:
+                    reverse_proxy_style_effective = forced_style
+                self._assert_reverse_proxy_host_allowed(reverse_proxy_base)
+            except ValueError as e:
+                return jsonify({"status": "error", "error": str(e)}), 400
 
         if not url:
             return jsonify({
@@ -729,6 +946,9 @@ class TurnstileAPIServer:
                 action,
                 cdata,
                 solve_timeout,
+                proxy_cfg_override,
+                reverse_proxy_base,
+                reverse_proxy_style_effective,
             )
 
             if self.debug:
