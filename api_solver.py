@@ -373,11 +373,10 @@ class TurnstileAPIServer:
                 elapsed_time = round(time.time() - start_time, 3)
                 self.results[task_id] = {"value": "CAPTCHA_FAIL", "elapsed_time": elapsed_time}
                 self._save_results()
-                if self.debug:
-                    logger.error(
-                        f"Browser {index}: Embedded Turnstile failed in "
-                        f"{COLORS.get('RED')}{elapsed_time}{COLORS.get('RESET')}s"
-                    )
+                logger.error(
+                    f"Browser {index}: Embedded Turnstile failed in "
+                    f"{COLORS.get('RED')}{elapsed_time}{COLORS.get('RESET')}s"
+                )
 
         try:
             if solve_timeout is not None:
@@ -394,14 +393,12 @@ class TurnstileAPIServer:
                 "message": f"Solve exceeded time limit of {solve_timeout} second(s).",
             }
             self._save_results()
-            if self.debug:
-                logger.error(f"Browser {index}: Embedded solve timeout (limit {solve_timeout}s)")
+            logger.error(f"Browser {index}: Embedded solve timeout (limit {solve_timeout}s)")
         except Exception as e:
             elapsed_time = round(time.time() - start_time, 3)
             self.results[task_id] = {"value": "CAPTCHA_FAIL", "elapsed_time": elapsed_time}
             self._save_results()
-            if self.debug:
-                logger.error(f"Browser {index}: Embedded solve error: {str(e)}")
+            logger.exception(f"Browser {index}: Embedded solve error: {str(e)}")
         finally:
             if context is not None:
                 try:
@@ -597,7 +594,7 @@ class TurnstileAPIServer:
                             f"Browser {index}: Session cookies captured (no Turnstile widget token) in "
                             f"{COLORS.get('GREEN')}{elapsed_time}{COLORS.get('RESET')}s — {page.url}"
                         )
-                    elif self.debug:
+                    else:
                         logger.error(
                             f"Browser {index}: No Turnstile token or cookies in {COLORS.get('RED')}{elapsed_time}{COLORS.get('RESET')}s"
                         )
@@ -663,8 +660,7 @@ class TurnstileAPIServer:
             except Exception as e:
                 elapsed_time = round(time.time() - start_time, 3)
                 self.results[task_id] = {"value": "CAPTCHA_FAIL", "elapsed_time": elapsed_time}
-                if self.debug:
-                    logger.error(f"Browser {index}: Error solving Turnstile: {str(e)}")
+                logger.exception(f"Browser {index}: Error solving Turnstile: {str(e)}")
 
         try:
             if solve_timeout is not None:
@@ -681,11 +677,10 @@ class TurnstileAPIServer:
                 "message": f"Solve exceeded time limit of {solve_timeout} second(s).",
             }
             self._save_results()
-            if self.debug:
-                logger.error(
-                    f"Browser {index}: Solve timeout after {COLORS.get('RED')}{elapsed_time}{COLORS.get('RESET')}s "
-                    f"(limit {solve_timeout}s)"
-                )
+            logger.error(
+                f"Browser {index}: Solve timeout after {COLORS.get('RED')}{elapsed_time}{COLORS.get('RESET')}s "
+                f"(limit {solve_timeout}s)"
+            )
         finally:
             if self.debug:
                 logger.debug(f"Browser {index}: Clearing page state")

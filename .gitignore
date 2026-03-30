@@ -172,3 +172,5 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+# Cursor AI Agent Team Framework (submodule)
+cursor-agent-team
