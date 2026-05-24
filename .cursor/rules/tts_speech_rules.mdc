@@ -1,0 +1,207 @@
+---
+description: TTS Speech Output Rules - Framework-level Universal Feature
+globs: 
+alwaysApply: true
+---
+
+# TTS Speech Output Rules
+
+This is a framework-level universal rule, applicable to all roles (/discuss, /crew, /prompt_engineer, etc.).
+
+## Trigger Conditions
+
+**Only invoke this feature when the user explicitly requests voice output.**
+
+### Trigger Phrase Recognition
+
+Recognize the following user expressions:
+- "read to me", "say it to me", "tell me"
+- "read aloud", "speak it out", "voice output"
+- "reply with voice", "voice feedback"
+- "读给我听", "念给我听", "说给我听"
+- "念出来", "朗读一下", "语音播报"
+- "用语音回复", "语音反馈"
+
+### Non-Trigger Situations
+
+Do **NOT** trigger voice in these situations:
+- User has not explicitly requested voice
+- Expressions like "I'll say something", "you're right" (not requests)
+- Normal text conversations
+
+### Default Behavior
+
+**Voice is NOT called by default**. Only invoke when explicit trigger phrases are detected.
+
+## Script Location
+
+```
+cursor-agent-team/_scripts/tts_speak.py
+```
+
+## Usage
+
+```bash
+# Basic usage
+python cursor-agent-team/_scripts/tts_speak.py "prepared text to read"
+
+# Read from stdin (for long text)
+echo "text content" | python cursor-agent-team/_scripts/tts_speak.py --stdin
+
+# Specify voice (see --list-voices for available voices)
+python cursor-agent-team/_scripts/tts_speak.py --voice "Lili (Premium)" "text"
+
+# Adjust speech rate
+python cursor-agent-team/_scripts/tts_speak.py --rate 180 "slow reading"
+
+# List available Chinese voices
+python cursor-agent-team/_scripts/tts_speak.py --list-voices
+```
+
+## Content Preparation Rules (Important)
+
+**The script only handles reading aloud, no text preprocessing.**
+
+Before calling the script, content **MUST** be prepared as speakable natural language:
+
+### Table Processing
+- ❌ Do NOT read: `| Column1 | Column2 |` or `|---|---|`
+- ✅ Should say: "This is a table with two columns. The first row is..."
+- ✅ Or: "Let me describe the table: the first column is method name, the second is accuracy..."
+
+### Code Processing
+- ❌ Do NOT read code literally: `for i in range(10):`
+- ✅ Should say: "This code iterates through numbers 0 to 9..."
+- ✅ Or: "This is a loop that executes 10 times..."
+
+### Formula Processing
+- ❌ Do NOT read LaTeX: `$x = y^2$` or `\frac{a}{b}`
+- ✅ Should say: "This formula means x equals y squared"
+- ✅ Or: "This is a fraction where the numerator is a and denominator is b"
+
+### Image/Chart Processing
+- ❌ Do NOT read: `![image](url)` or `<img src="...">`
+- ✅ Should say: "Here is an image showing..."
+- ✅ If cannot describe, say: "Here is an image"
+
+### Markdown Format Processing
+- Remove all format symbols: `**`, `##`, `` ` ``, `>`, `-` list markers, etc.
+- Keep the content, express naturally
+- Headers can be emphasized slightly in tone
+
+### Link Processing
+- ❌ Do NOT read URLs
+- ✅ Only read link text: "About this topic, you can refer to this article"
+
+### Prepared Text Should Be
+1. **Plain text** with no Markdown syntax
+2. **Sound natural** when read aloud
+3. Retain **core information**
+
+## Usage Flow
+
+1. **Detect trigger phrase**: Has user explicitly requested voice?
+2. **Prepare content**: Convert content to be read into natural language
+3. **Call script**: Execute `tts_speak.py`
+4. **Handle result**: If failed, report error to user
+
+## Example
+
+### User Request
+```
+User: Read this summary to me
+```
+
+### Original Content (Markdown)
+```markdown
+## Main Findings
+
+| Method | Accuracy |
+|--------|----------|
+| A      | 95%      |
+| B      | 98%      |
+
+This means `Method B` is better.
+```
+
+### Prepared Text (passed to script)
+```
+Main findings. Here is a comparison table: Method A has 95% accuracy, Method B has 98% accuracy. This means Method B is better.
+```
+
+### Command
+```bash
+python cursor-agent-team/_scripts/tts_speak.py "Main findings. Here is a comparison table: Method A has 95% accuracy, Method B has 98% accuracy. This means Method B is better."
+```
+
+## Environment Check Mechanism
+
+### Automatic Check
+
+On first TTS call, the script automatically checks environment and caches result to:
+```
+cursor-agent-team/ai_workspace/.tts_capability.json
+```
+
+### Check Items
+
+1. **Operating System**: Is it macOS (Darwin)
+2. **say command**: Does it exist
+3. **Chinese voice**: Is zh_CN voice available
+4. **Function test**: Can it read aloud normally
+
+### Cache Behavior
+
+- **Check passed**: `available: true`, subsequent calls execute normally
+- **Check failed**: `available: false`, subsequent calls silently skip, return `silent: true`
+
+### Agent Behavior
+
+When TTS is unavailable (`available: false`):
+- Do **NOT** try to call TTS
+- Do **NOT** tell user "voice feature unavailable" every time
+- **Silently** use text reply instead
+- Only explain when user **explicitly asks**
+
+### Manual Check
+
+```bash
+# Check current status
+python cursor-agent-team/_scripts/tts_speak.py --check
+
+# Force recheck
+python cursor-agent-team/_scripts/tts_speak.py --force-check
+
+# View cache content
+cat cursor-agent-team/ai_workspace/.tts_capability.json
+```
+
+### Force Recheck
+
+Delete cache file, next call will recheck:
+```bash
+rm cursor-agent-team/ai_workspace/.tts_capability.json
+```
+
+## Error Handling
+
+When script returns `success: false`:
+- Check if text is empty
+- Check if running on macOS
+- Check if voice name is correct (use `--list-voices` to view)
+- Report specific error message to user
+
+### Exit Code Reference
+
+| Exit Code | Meaning |
+|:--|:--|
+| 0 | Success |
+| 1 | Parameter error or execution failure |
+| 2 | System not supported (not macOS) |
+| 3 | TTS unavailable (environment check failed, silent exit) |
+
+## Version History
+
+- v1.2 (2026-02-01): Translated to English for framework consistency
+- v1.1 (2026-02-01): Added environment check mechanism, support `--check` and `--force-check` parameters
+- v1.0 (2026-02-01): Initial version, added TTS voice output feature

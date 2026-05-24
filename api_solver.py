@@ -172,6 +172,21 @@ class TurnstileAPIServer:
             return None
         return frozenset(h.strip().lower() for h in raw.split(",") if h.strip())
 
+    @staticmethod
+    def _reverse_proxy_bypass_hosts_env() -> frozenset:
+        """Hosts that must stay direct even when reverse_proxy is enabled."""
+        raw = os.environ.get("REVERSE_PROXY_BYPASS_HOSTS")
+        if raw is None:
+            raw = "challenges.cloudflare.com"
+        return frozenset(h.strip().lower() for h in raw.split(",") if h.strip())
+
+    @staticmethod
+    def _host_matches(host: str, patterns: frozenset) -> bool:
+        h = (host or "").lower().strip(".")
+        if not h:
+            return False
+        return any(h == p or h.endswith("." + p) for p in patterns)
+
     def _assert_reverse_proxy_host_allowed(self, normalized_base: str) -> None:
         allowed = self._reverse_proxy_allowed_hosts_env()
         if not allowed:
@@ -201,26 +216,72 @@ class TurnstileAPIServer:
         if not (u.startswith("http://") or u.startswith("https://")):
             await route.continue_()
             return
+        host = (urlparse(u).hostname or "").lower()
+        if self._host_matches(host, self._reverse_proxy_bypass_hosts_env()):
+            if self.debug:
+                logger.debug(
+                    f"Browser {browser_index}: reverse_proxy bypass [{req.resource_type}] "
+                    f"{u[:160]}{'…' if len(u) > 160 else ''}"
+                )
+            await route.continue_()
+            return
         nu = self._build_reverse_proxied_url(u, base, style)
         if nu != u and self.debug:
             logger.debug(
                 f"Browser {browser_index}: reverse_proxy [{req.resource_type}] "
                 f"{u[:160]}{'…' if len(u) > 160 else ''} -> {nu[:160]}{'…' if len(nu) > 160 else ''}"
             )
-        await route.continue_(url=nu)
+        if nu == u:
+            await route.continue_()
+            return
+
+        # Important: do not `continue_(url=nu)` for reverse-proxy mode.
+        #
+        # Continuing with the proxy URL makes Chromium treat the network response as coming from
+        # the worker host. GoPlay then returns cookies such as `d` and `locl` on the proxied
+        # document, but the browser rejects them because their Domain is `.goplay.ml` while the
+        # response URL is `*.workers.dev`. Fetching the proxied URL ourselves and fulfilling the
+        # original route keeps the browser-visible response scoped to the original URL, so the
+        # target-domain cookies are accepted and can be captured by the solver.
+        try:
+            response = await route.fetch(url=nu, timeout=60000)
+            await route.fulfill(response=response)
+            return
+        except Exception as e:
+            # The context may already be closing after the solve succeeds, leaving late image/XHR
+            # routes disposed. Avoid turning that into a solve failure. For active requests, fall
+            # back to URL rewrite when possible so reverse_proxy still has a best-effort path.
+            if self.debug:
+                msg = str(e).replace("\n", " ")[:240]
+                logger.warning(
+                    f"Browser {browser_index}: reverse_proxy fetch/fulfill failed "
+                    f"[{req.resource_type}] {u[:120]}{'…' if len(u) > 120 else ''}: {msg}"
+                )
+            try:
+                await route.continue_(url=nu)
+            except Exception:
+                pass
 
     _PROXY_SCHEMES = frozenset(("http", "https", "socks5", "socks4"))
 
     @staticmethod
     def _parse_proxy_spec(spec: str) -> Dict[str, str]:
-        """Playwright ``proxy`` dict from a URL or compact ``scheme:host:port[:user:pass]`` string."""
+        """Playwright ``proxy`` dict from a URL or compact proxy string.
+
+        Supported formats:
+        - scheme://host:port
+        - scheme://user:pass@host:port
+        - scheme:host:port
+        - scheme:host:port:user:pass
+        - scheme:user:pass:host:port
+        """
         s = (spec or "").strip()
         if not s:
             raise ValueError("Proxy spec is empty")
         if "://" in s:
             p = urlparse(s)
             if not p.scheme or not p.hostname or not p.port:
-                raise ValueError("Proxy URL must include scheme, host, and port (e.g. socks5://127.0.0.1:1080)")
+                raise ValueError("Proxy URL must include scheme, host, and port (e.g. http://127.0.0.1:8080 or socks5://127.0.0.1:1080)")
             sch = p.scheme.lower()
             if sch not in TurnstileAPIServer._PROXY_SCHEMES:
                 raise ValueError(f"Unsupported proxy scheme '{p.scheme}'; use http, https, socks5, or socks4")
@@ -244,22 +305,35 @@ class TurnstileAPIServer:
                 raise ValueError("Proxy port must be numeric") from e
             return {"server": f"{scheme}://{host}:{port_s}"}
         if len(parts) == 5:
-            scheme, host, port_s, user, pwd = parts
-            scheme = scheme.lower()
+            scheme = parts[0].lower()
             if scheme not in TurnstileAPIServer._PROXY_SCHEMES:
                 raise ValueError(f"Unsupported proxy scheme '{scheme}'")
+
+            # Legacy compact form: scheme:host:port:user:pass
+            if parts[2].isdigit():
+                _, host, port_s, user, pwd = parts
+            # Provider compact form: scheme:user:pass:host:port
+            elif parts[4].isdigit():
+                _, user, pwd, host, port_s = parts
+            else:
+                raise ValueError(
+                    "Proxy port must be numeric. Supported compact auth formats: "
+                    "scheme:host:port:user:pass or scheme:user:pass:host:port"
+                )
+
             try:
                 int(port_s)
             except ValueError as e:
                 raise ValueError("Proxy port must be numeric") from e
             return {
                 "server": f"{scheme}://{host}:{port_s}",
-                "username": user,
-                "password": pwd,
+                "username": unquote(user),
+                "password": unquote(pwd),
             }
         raise ValueError(
             "Invalid proxy format. Use: scheme://host:port, scheme://user:pass@host:port, "
-            "or scheme:host:port[:user:pass] (same rules as query parameter 'proxy')"
+            "scheme:host:port, scheme:host:port:user:pass, or scheme:user:pass:host:port "
+            "(same rules as query parameter 'proxy')"
         )
 
     def _pick_proxy_for_solve(
@@ -293,8 +367,10 @@ class TurnstileAPIServer:
             if self.browser_type in ("chromium", "chrome", "msedge"):
                 raise ValueError(
                     "Chromium (chromium/chrome/msedge) does not support SOCKS proxy authentication. "
-                    "Use SOCKS without credentials, an HTTP or HTTPS proxy with user:pass "
-                    "(e.g. http://user:pass@host:port), or --browser_type camoufox (Firefox)."
+                    "Use socks5:host:port without credentials, an HTTP or HTTPS proxy with user:pass "
+                    "(e.g. http:user:pass:host:port, http://user:pass@host:port, "
+                    "https:user:pass:host:port, or https://user:pass@host:port), "
+                    "or --browser_type camoufox (Firefox)."
                 )
 
     def _browser_context_options(self, proxy: Optional[Dict[str, str]]) -> Dict[str, Any]:
@@ -448,11 +524,14 @@ class TurnstileAPIServer:
 
         for _ in range(self.thread_count):
             if self.browser_type in ['chromium', 'chrome', 'msedge']:
-                browser = await playwright.chromium.launch(
-                    channel=self.browser_type,
-                    headless=self.headless,
-                    args=self.browser_args
-                )
+                launch_options = {
+                    "headless": self.headless,
+                    "args": self.browser_args,
+                }
+                # No channel means the bundled installed Chromium. Chrome/Edge are real channels.
+                if self.browser_type != 'chromium':
+                    launch_options["channel"] = self.browser_type
+                browser = await playwright.chromium.launch(**launch_options)
 
             elif self.browser_type == "camoufox":
                 browser = await camoufox.start()

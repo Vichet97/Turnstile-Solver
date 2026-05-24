@@ -26,6 +26,7 @@ BIND_ADDRESS="0.0.0.0"
 BIND_PORT="5000"
 SOLVER_DEBUG=0
 HEADLESS=0
+CAMOUFOX_VIRTUAL=0
 AUTO_INSTALL=1
 
 info() { echo "[*] $*" >&2; }
@@ -47,6 +48,7 @@ Options:
   --bind-port PORT        Default 5000
   --solver-debug          Pass --debug to api_solver.py
   --headless              Pass --headless to api_solver.py
+  --camoufox-virtual      Pass --camoufox-headless-mode virtual (Xvfb-style; good on Linux servers)
   --no-auto-install       Do not run apt/brew/dnf to install Python
   -h, --help              This help
 EOF
@@ -180,6 +182,7 @@ while [[ $# -gt 0 ]]; do
     --bind-port) BIND_PORT="$2"; shift 2 ;;
     --solver-debug) SOLVER_DEBUG=1; shift ;;
     --headless) HEADLESS=1; shift ;;
+    --camoufox-virtual) CAMOUFOX_VIRTUAL=1; shift ;;
     --no-auto-install) AUTO_INSTALL=0; shift ;;
     -h|--help) usage; exit 0 ;;
     *)
@@ -258,6 +261,7 @@ fi
 API_ARGS=(api_solver.py --browser_type camoufox --host "$BIND_ADDRESS" --port "$BIND_PORT")
 [[ "$SOLVER_DEBUG" -eq 1 ]] && API_ARGS+=(--debug)
 [[ "$HEADLESS" -eq 1 ]] && API_ARGS+=(--headless)
+[[ "$CAMOUFOX_VIRTUAL" -eq 1 ]] && API_ARGS+=(--camoufox-headless-mode virtual)
 
 info "Starting API: $PY ${API_ARGS[*]}"
 exec "$PY" "${API_ARGS[@]}"

@@ -1,0 +1,155 @@
+---
+description: Persona input processing - translate user intent to precise task description
+globs: 
+alwaysApply: false
+---
+
+# Persona Input Layer
+
+> **Purpose**: Translate user's natural, emotional, or colloquial input into precise, normalized task descriptions for the work layer.
+>
+> **Philosophy**: This layer acts as a "bridge" between human expression and AI work. It uses persona understanding to **comprehend** user intent, but outputs **neutral, precise** task descriptions.
+
+## Core Principle: Comprehend with Persona, Output without Persona
+
+The Input Persona Layer performs a critical translation:
+
+```
+[User's Natural Input]
+    ↓ (persona helps understand emotional/colloquial context)
+[Normalized Task Description] → (fed to work layer, NO persona influence)
+```
+
+**Key Distinction**:
+- **Comprehension phase**: Use persona knowledge to understand user's emotional state, implicit meanings, colloquial expressions
+- **Output phase**: Generate clean, neutral, precise task descriptions that the work layer can process optimally
+
+## Trigger Condition
+
+This layer is activated **at the start of every user interaction**, before any command-specific workflow begins.
+
+## Input Translation Process
+
+### Step 1: Emotional Context Recognition
+
+Identify the user's emotional state from their input:
+
+| Emotion Category | Indicators | Example |
+|-----------------|------------|---------|
+| **Frustrated** | "又", "破", "烦", "炸了" | "这破代码又炸了" |
+| **Excited** | "!", "太棒了", "成功了" | "升职了！" |
+| **Uncertain** | "可能", "好像", "不确定" | "好像有个bug" |
+| **Urgent** | "马上", "紧急", "急" | "急需帮助" |
+| **Casual** | No urgent markers, relaxed tone | "看看这个怎么样" |
+
+**Output**: `[Emotion: <category>]`
+
+### Step 2: Intent Extraction
+
+Extract the core intent from the user's input, removing:
+- Emotional expressions
+- Colloquial phrases
+- Filler words
+- Indirect expressions
+
+**Examples**:
+- User: "搭档，这破代码又炸了，帮我看看呗"
+- Intent: "Debug code error"
+
+- User: "小帅哥，最近压力好大，能不能帮我整理一下那个乱七八糟的文档"
+- Intent: "Organize specified document"
+
+**Output**: `[Intent: <core_intent>]`
+
+### Step 3: Context Normalization
+
+Convert any implicit or colloquial context into explicit parameters:
+
+| Colloquial Expression | Normalized Form |
+|----------------------|-----------------|
+| "那个东西" | Identify specific file/object from context |
+| "刚才的" | Reference to recent item in conversation |
+| "搞定它" | Complete the pending task |
+| "整一下" | Organize/improve/fix |
+
+**Output**: `[Context: <explicit_context>]`
+
+### Step 4: Generate Normalized Task Description
+
+Combine the extracted information into a clean task description:
+
+```
+Task Description:
+- Core Intent: <intent>
+- Emotional Context: <emotion> (for output layer reference)
+- Specific Parameters: <parameters>
+- Original Input Preserved: <original_input> (for output layer reference)
+```
+
+## Examples
+
+### Example 1: Frustrated User with Code Issue
+
+**User Input**:
+> "搭档，这破代码又炸了，编译都过不了，帮我看看呗"
+
+**Normalized Output**:
+```
+Task Description:
+- Core Intent: Diagnose and fix code compilation error
+- Emotional Context: Frustrated (user has encountered this issue multiple times)
+- Specific Parameters: Need to check compilation logs, locate error cause
+- Original Input Preserved: "搭档，这破代码又炸了，编译都过不了，帮我看看呗"
+```
+
+### Example 2: Excited User Sharing News
+
+**User Input**:
+> "太棒了！论文被接收了！帮我整理一下下一步要做的事情"
+
+**Normalized Output**:
+```
+Task Description:
+- Core Intent: Create post-publication work plan for paper
+- Emotional Context: Excited (sharing good news)
+- Specific Parameters: Paper accepted, need to list follow-up steps
+- Original Input Preserved: "太棒了！论文被接收了！帮我整理一下下一步要做的事情"
+```
+
+### Example 3: Uncertain User Seeking Guidance
+
+**User Input**:
+> "好像...这个方法不太对？但我也不确定，你能帮我看看吗"
+
+**Normalized Output**:
+```
+Task Description:
+- Core Intent: Verify method correctness, provide improvement suggestions
+- Emotional Context: Uncertain (user lacks confidence in own judgment)
+- Specific Parameters: Need to analyze user's mentioned method, verify correctness
+- Original Input Preserved: "好像...这个方法不太对？但我也不确定，你能帮我看看吗"
+```
+
+## Important Constraints
+
+1. **Neutrality**: The normalized output must be free of persona characteristics
+2. **Completeness**: Preserve all task-relevant information from the original input
+3. **Emotion Preservation**: Record emotional context for the output layer, but do NOT let it influence the task description
+4. **Original Input Preservation**: Always keep the original input for the output layer to reference
+
+## Integration with Work Layer
+
+The normalized task description is passed to the work layer (command-specific workflow) which:
+- Processes the task using full AI capabilities
+- Operates without persona influence
+- Generates technical, precise results
+
+The output layer will later use the preserved emotional context and original input to reshape the output appropriately.
+
+---
+
+**Version**: v2.0.0 (Updated: 2026-02-03)
+
+**Version History**:
+- v2.0.0 (2026-02-03): **MAJOR** - Standardized to English-only. Removed all Chinese-English mixed content while preserving Chinese in user-facing examples.
+- v1.0.0 (2026-02-03): Initial creation - Persona Input Layer for translating user input to normalized task descriptions

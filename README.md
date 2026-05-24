@@ -150,11 +150,33 @@ docker run -d -p 3389:3389 -p 5000:5000 -e TZ=Asia/Baku --name turnstile_solver 
 | `action`   | string  | Action to trigger during CAPTCHA solving, e.g., `login`            | No       |
 | `cdata`    | string  | Custom data that can be used for additional CAPTCHA parameters.    | No       |
 | `timeout`  | number  | Max solve time in seconds. | No |
-| `proxy`    | string  | Outbound proxy for this job (`http(s)://…`, `socks5:host:port`, or with auth — SOCKS+auth needs Firefox/camoufox, not Chrome). | No |
+| `proxy`    | string  | Outbound proxy for this job. Supported schemes: `http`, `https`, `socks5`, and `socks4`. Supported formats: `scheme://host:port`, `scheme://user:pass@host:port`, `scheme:host:port`, `scheme:host:port:user:pass`, or `scheme:user:pass:host:port` (examples: `?proxy=http:user:pass:ip:port`, `?proxy=http://user:pass@ip:port`, `?proxy=https:user:pass:ip:port`). SOCKS auth like `?proxy=socks5:user:pass:ip:port` is parsed, but Chromium cannot use authenticated SOCKS; use unauthenticated `socks5:ip:port`, HTTP(S) auth, or camoufox. | No |
 | `reverse_proxy` | string | Worker base URL. Optional path suffix **`/SCHEMA`** (case-sensitive): strip it from the base and force **full** tails (`…/https://goplay.ml/`). Without **`/SCHEMA`**, default tails omit the scheme (`…/goplay.ml/`); override with `reverse_proxy_style=full` if needed. | No |
 | `reverse_proxy_style` | string | `host` (default) = tail is `hostname/path…` (no `https://` in path). `full` = tail includes scheme. Ignored when `reverse_proxy` ends with **`/SCHEMA`**. | No |
 
 **Environment:** Optional `ALLOWED_REVERSE_PROXY_HOSTS` — comma-separated hostnames allowed for `reverse_proxy` (e.g. `as.mykhcdn.workers.dev`). If unset, any host is allowed.
+
+`REVERSE_PROXY_BYPASS_HOSTS` controls hosts that stay direct even when `reverse_proxy` is enabled. Default: `challenges.cloudflare.com`, because Cloudflare Turnstile assets commonly return `403` when fetched through a generic worker prefix.
+
+When `reverse_proxy` is enabled, the solver fetches the worker URL internally and fulfills the original browser request instead of navigating the browser to the worker URL. This keeps cookies scoped to the protected target host (for example `.goplay.ml`) so target-domain session cookies are accepted by Chromium.
+
+Prefix-style reverse proxy examples:
+
+```http
+GET /turnstile?url=https%3A%2F%2Fhttpbin.org%2Fheaders&timeout=90&reverse_proxy=https%3A%2F%2Fas.mykhcdn.workers.dev%2F
+```
+
+With the default `reverse_proxy_style=host`, browser requests are routed like:
+
+```text
+https://httpbin.org/headers -> https://as.mykhcdn.workers.dev/httpbin.org/headers
+```
+
+Use `reverse_proxy_style=full` (or end `reverse_proxy` with `/SCHEMA`) only when the worker expects the scheme in the path:
+
+```text
+https://httpbin.org/headers -> https://as.mykhcdn.workers.dev/https://httpbin.org/headers
+```
 
 #### Response:
 

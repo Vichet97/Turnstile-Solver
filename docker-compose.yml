@@ -10,6 +10,8 @@ services:
       - PYTHONUNBUFFERED=1
       - DISPLAY=:99
       - RUN_API_SOLVER=true
+      - SOLVER_BROWSER_TYPE=chromium
+      - SOLVER_THREAD=1
     volumes:
       # Optional: Mount logs directory for persistence
       - ./logs:/app/logs

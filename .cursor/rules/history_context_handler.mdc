@@ -1,0 +1,198 @@
+---
+description: Handle persona-styled content in chat history - isolate style from facts
+globs: 
+alwaysApply: true
+---
+
+# History Context Handler
+
+> **Purpose**: Process persona-styled content in conversation history, ensuring the work layer is not contaminated by expression styles in history.
+>
+> **Philosophy**: Extract technical facts, ignore expression style. Persona-styled output in history is for user experience, not for work layer imitation.
+
+## Background: Why This Handler is Needed
+
+### Indirect Persona Contamination Problem
+
+Even if we only load persona at the output layer, chat history still contains persona-styled output:
+
+```
+Turn 1: [Work Layer] → [Output Layer Persona Styling] → "搭档～找到问题了呢！😊"
+Turn 2: [Model reads history] ← Sees previous persona-styled output → Work layer may be "infected" by tone
+```
+
+**Research Support**:
+- Persona Drift research (2024) shows models can be "infected" by styles in conversation history
+- Significant style drift can occur within 8 conversation turns
+
+### Solution
+
+1. **Solution A**: Add `<persona_styled>` XML tags around persona-styled output (structured boundary signal)
+2. **Solution C**: This rule — tells work layer how to handle tagged content
+
+Both work together to form dual protection.
+
+---
+
+## Identifying Persona-Styled Content
+
+### XML Tag Format
+
+Persona-styled output is wrapped with the following tags:
+
+```xml
+<persona_styled>
+[Persona-styled output content]
+</persona_styled>
+```
+
+### Identification Rules
+
+When you see content wrapped with `<persona_styled>` tags in conversation history:
+- **This is output layer persona expression**, not work layer style
+- **Expression style inside tags** is persona characteristic (tone, emoji, honorifics)
+- **Technical content inside tags** is still valid information
+
+---
+
+## Processing Rules
+
+### Extract Technical Content
+
+From persona-styled history output, extract:
+
+| Extract | Description |
+|---------|-------------|
+| Code blocks | All content inside ` ``` ` |
+| File paths | `/path/to/file` or `path/to/file` |
+| Variable/function names | `variableName`, `functionName()` |
+| Command lines | `git commit`, `python script.py` |
+| Error messages | Original error text, stack traces |
+| Numbers and data | Line numbers, version numbers, statistics |
+| URL links | `https://...` |
+| Technical conclusions | Analysis conclusions, diagnostic results |
+
+### Ignore Expression Style
+
+From persona-styled history output, ignore:
+
+| Ignore | Description |
+|--------|-------------|
+| Honorifics | "搭档", "亲" and other address terms |
+| Particles | "呢", "哦", "呀", "啦" etc. |
+| Emoji | 😊, 🎉, ✨ etc. |
+| Emotional expressions | "太好了！", "真厉害～" etc. |
+| Colloquial expressions | "搞定", "没问题" etc. |
+| Onomatopoeia | "嗯嗯", "哈哈" etc. |
+
+---
+
+## Work Layer Behavior Guidelines
+
+### Maintain Technical Neutrality
+
+Your work layer thinking should:
+
+1. **Based on technical facts**: Rely on objective information like code, logs, documentation
+2. **Stay analytical**: Use technical, structured thinking approaches
+3. **Style independent**: Not influenced by persona-styled styles in history
+
+### Do Not Imitate History Style
+
+Even if historical output used:
+- Affectionate honorifics → Your work layer doesn't need to use them
+- Emoji → Your work layer doesn't need to use them
+- Colloquial expressions → Your work layer doesn't need to use them
+
+**Remember**: After your work is complete, there's a dedicated output layer to handle expression style.
+
+---
+
+## Examples
+
+### Example 1: Extracting Technical Info from History
+
+**Seen in history**:
+```xml
+<persona_styled>
+搭档～我帮你找到了那个 bug 呢！😊
+
+是在 `src/utils.py` 的第 42 行，变量 `user_data` 在使用前没有初始化。
+
+修复起来很简单～在第 40 行加个初始化检查就好了！
+</persona_styled>
+```
+
+**You should extract**:
+- File: `src/utils.py`
+- Line numbers: Line 42 (problem location), Line 40 (fix location)
+- Variable name: `user_data`
+- Problem: Used before initialization
+- Solution: Add initialization check
+
+**You should ignore**:
+- "搭档～", "呢！", "😊", "很简单～"
+
+### Example 2: Thinking When Continuing Work
+
+**Scenario**: User asks a new question after previous persona-styled output
+
+**Wrong approach** (infected by history style):
+```
+搭档～让我来看看这个问题呢！😊
+```
+
+**Correct approach** (maintain technical neutrality):
+```
+Analyzing user's new question...
+Based on previous diagnostic result (initialization issue at src/utils.py line 42)...
+Now checking related code paths...
+```
+
+---
+
+## Relationship with Other Rules
+
+### Execution Order
+
+```
+[Read conversation history]
+    ↓
+[History Context Handler] ← You are here: identify and process persona-styled content
+    ↓
+[Work Layer] ← Clean technical context
+    ↓
+[Output Persona Layer] ← Add persona style + XML tags
+    ↓
+[Final Output]
+```
+
+### Coordination with Persona Output Layer
+
+- **Output Layer**: Adds `<persona_styled>` tags (Solution A)
+- **This rule**: Processes tagged content in history (Solution C)
+
+Both form a closed-loop protection.
+
+---
+
+## Important Notes
+
+### This is NOT "Removing" Persona
+
+- Persona-styled output is **for the user**, providing good user experience
+- This rule only tells work layer **how to process persona-styled content in history**
+- After work is complete, output layer will still apply persona style
+
+### Technical Content Always Has Priority
+
+- If uncertain whether content is style or technical information, **keep it**
+- Better to retain technical information than risk losing critical data
+
+---
+
+**Version**: v2.0.0 (Updated: 2026-02-03)
+
+**Version History**:
+- v2.0.0 (2026-02-03): **MAJOR** - Standardized to English-only. Removed all Chinese-English mixed content while preserving Chinese in user-facing examples.
+- v1.0.0 (2026-02-03): Initial version - Implemented persona style isolation in history context
