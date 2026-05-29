@@ -263,19 +263,25 @@ class TurnstileAPIServer:
         try:
             response = await route.fetch(url=nu, timeout=60000)
             if req.resource_type == "document" and host.endswith("goplay.ml") and response.status >= 400:
-                body = await response.body()
+                text_body = await response.text()
                 headers = dict(response.headers)
+                headers.pop("content-encoding", None)
+                headers.pop("Content-Encoding", None)
+                headers.pop("content-length", None)
+                headers.pop("Content-Length", None)
+                headers["content-type"] = headers.get("content-type") or headers.get("Content-Type") or "text/html; charset=UTF-8"
                 headers["x-turnstile-upstream-status"] = str(response.status)
                 headers["x-turnstile-upstream-url"] = nu
                 if self.debug:
                     logger.warning(
                         f"Browser {browser_index}: reverse_proxy document status rewrite "
-                        f"{response.status} -> 200 for {u[:120]}{'…' if len(u) > 120 else ''}"
+                        f"{response.status} -> 200 for {u[:120]}{'…' if len(u) > 120 else ''} "
+                        f"body_excerpt={self._trim_text(text_body, 180)}"
                     )
                 await route.fulfill(
                     status=200,
                     headers=headers,
-                    body=body,
+                    body=text_body,
                 )
                 return
             await route.fulfill(response=response)
