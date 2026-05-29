@@ -91,12 +91,22 @@ class TurnstileAPIServer:
     </html>
     """
 
-    def __init__(self, headless: bool, useragent: str, debug: bool, browser_type: str, thread: int, proxy_support: bool):
+    def __init__(
+        self,
+        headless: bool,
+        useragent: str,
+        debug: bool,
+        browser_type: str,
+        thread: int,
+        proxy_support: bool,
+        close_delay: float = 0,
+    ):
         self.app = Quart(__name__)
         self.debug = debug
         self.results = self._load_results()
         self.browser_type = browser_type
         self.headless = headless
+        self.close_delay = max(0.0, float(close_delay or 0))
         self.useragent = useragent
         self.thread_count = thread
         self.proxy_support = proxy_support
@@ -106,6 +116,12 @@ class TurnstileAPIServer:
             self.browser_args.append(f"--user-agent={useragent}")
 
         self._setup_routes()
+
+    async def _delay_before_close(self, browser_index: int) -> None:
+        if self.close_delay <= 0:
+            return
+        logger.info(f"Browser {browser_index}: Keeping page open for {self.close_delay:g}s before cleanup")
+        await asyncio.sleep(self.close_delay)
 
     @staticmethod
     def _normalize_page_url(url: str) -> str:
@@ -479,6 +495,151 @@ class TurnstileAPIServer:
             return ""
 
     @staticmethod
+    def _trim_text(value: Any, limit: int = 240) -> str:
+        text = " ".join(str(value or "").split())
+        if len(text) <= limit:
+            return text
+        return text[: max(0, limit - 1)] + "…"
+
+    @staticmethod
+    def _cookie_name_list(cookies: List[Dict[str, Any]]) -> List[str]:
+        names = sorted({str(cookie.get("name")) for cookie in (cookies or []) if cookie.get("name")})
+        return names[:20]
+
+    @staticmethod
+    def _has_cookie_name(cookies: List[Dict[str, Any]], name: str) -> bool:
+        return any(cookie.get("name") == name for cookie in (cookies or []))
+
+    async def _collect_page_diagnostics(self, page) -> Dict[str, Any]:
+        diagnostics: Dict[str, Any] = {}
+        if page is None:
+            return diagnostics
+
+        try:
+            diagnostics.update(await page.evaluate(
+                """() => {
+                    const bodyText = document.body
+                        ? ((document.body.innerText || document.body.textContent || '').replace(/\\s+/g, ' ').trim())
+                        : '';
+                    const count = (selector) => document.querySelectorAll(selector).length;
+                    return {
+                        title: document.title || '',
+                        body_excerpt: bodyText.slice(0, 600),
+                        body_length: bodyText.length,
+                        widget_count: count("div.cf-turnstile, .cf-turnstile, [data-sitekey], [name='cf-turnstile-response'], textarea[name='cf-turnstile-response'], input[name='cf-turnstile-response']"),
+                        iframe_count: count("iframe[src*='turnstile'], iframe[src*='challenges.cloudflare.com'], iframe[title*='Cloudflare']"),
+                        has_access_denied: /access denied|forbidden|not authorized/i.test(bodyText),
+                        has_rate_limited: /rate limit|too many requests|too many times|try again later/i.test(bodyText),
+                        has_cloudflare_interstitial: /just a moment|checking your browser|verify you are human|attention required|security check/i.test(bodyText),
+                        has_turnstile_text: /turnstile|captcha|verify/i.test(bodyText),
+                    };
+                }"""
+            ) or {})
+        except Exception as e:
+            diagnostics["diagnostic_error"] = self._trim_text(e, 160)
+
+        try:
+            diagnostics["url"] = page.url
+        except Exception:
+            pass
+
+        if diagnostics.get("title"):
+            diagnostics["title"] = self._trim_text(diagnostics["title"], 160)
+        if diagnostics.get("body_excerpt"):
+            diagnostics["body_excerpt"] = self._trim_text(diagnostics["body_excerpt"], 320)
+        return diagnostics
+
+    @staticmethod
+    def _classify_solve_failure_reason(
+        diagnostics: Dict[str, Any],
+        cookies: List[Dict[str, Any]],
+    ) -> str:
+        if diagnostics.get("has_access_denied"):
+            return "access_denied_page"
+        if diagnostics.get("has_rate_limited"):
+            return "rate_limited_page"
+        if diagnostics.get("has_cloudflare_interstitial"):
+            return "cloudflare_interstitial_unresolved"
+        if cookies and (
+            TurnstileAPIServer._has_cookie_name(cookies, "d")
+            or TurnstileAPIServer._has_cookie_name(cookies, "locl")
+            or TurnstileAPIServer._has_cookie_name(cookies, "cf_clearance")
+        ):
+            return "partial_session_cookies_only"
+        if diagnostics.get("widget_count") or diagnostics.get("iframe_count"):
+            return "turnstile_present_but_unsolved"
+        if diagnostics.get("has_turnstile_text"):
+            return "turnstile_page_without_widget"
+        return "no_turnstile_token_or_session_cookies"
+
+    @staticmethod
+    def _failure_reason_message(reason: str) -> str:
+        messages = {
+            "embedded_no_token_after_attempts": "Embedded widget never returned a Turnstile token before attempts were exhausted.",
+            "turnstile_present_but_unsolved": "Turnstile widget/iframe was present but no token or required session cookies were produced.",
+            "turnstile_page_without_widget": "Turnstile-related text was detected, but no usable widget/token field became available.",
+            "cloudflare_interstitial_unresolved": "Cloudflare interstitial/challenge page remained unresolved.",
+            "access_denied_page": "The target page rendered an access denied / forbidden response.",
+            "rate_limited_page": "The target page appears rate-limited or temporarily blocked.",
+            "partial_session_cookies_only": "Only partial session cookies were captured; required token or cookie set was incomplete.",
+            "no_turnstile_token_or_session_cookies": "No Turnstile token or usable session cookies were captured.",
+            "embedded_solver_exception": "Embedded Turnstile solver raised an exception.",
+            "solver_exception": "Turnstile solver raised an exception.",
+            "solve_timeout": "Solve exceeded the configured time limit.",
+        }
+        return messages.get(reason, reason.replace("_", " "))
+
+    async def _build_failure_payload(
+        self,
+        *,
+        elapsed_time: float,
+        reason: str,
+        page=None,
+        cookies: Optional[List[Dict[str, Any]]] = None,
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {
+            "value": "CAPTCHA_FAIL",
+            "elapsed_time": elapsed_time,
+            "reason": reason,
+            "message": self._failure_reason_message(reason),
+        }
+        if page is not None:
+            diagnostics = await self._collect_page_diagnostics(page)
+            if diagnostics:
+                payload["page"] = diagnostics
+                if diagnostics.get("url"):
+                    payload["url_final"] = diagnostics["url"]
+        if cookies is not None:
+            payload["cookie_names"] = self._cookie_name_list(cookies)
+            payload["d_cookie_present"] = self._has_cookie_name(cookies, "d")
+            payload["locl_cookie_present"] = self._has_cookie_name(cookies, "locl")
+            payload["cf_clearance_present"] = self._has_cookie_name(cookies, "cf_clearance")
+        if extra:
+            payload.update(extra)
+        return payload
+
+    def _log_failure_payload(self, browser_index: int, task_id: str, payload: Dict[str, Any]) -> None:
+        page = payload.get("page") or {}
+        logger.error(
+            "Browser %s: Solve rejected | task_id=%s reason=%s message=%s final_url=%s title=%s "
+            "widget_count=%s iframe_count=%s cookies=%s d_cookie=%s locl_cookie=%s cf_clearance=%s body_excerpt=%s",
+            browser_index,
+            task_id,
+            payload.get("reason"),
+            payload.get("message"),
+            page.get("url") or payload.get("url_final") or "",
+            page.get("title") or "",
+            page.get("widget_count"),
+            page.get("iframe_count"),
+            payload.get("cookie_names") or [],
+            payload.get("d_cookie_present"),
+            payload.get("locl_cookie_present"),
+            payload.get("cf_clearance_present"),
+            page.get("body_excerpt") or "",
+        )
+
+    @staticmethod
     def _load_results():
         """Load previous results from results.json."""
         try:
@@ -635,12 +796,19 @@ class TurnstileAPIServer:
 
             if self.results.get(task_id) == "CAPTCHA_NOT_READY":
                 elapsed_time = round(time.time() - start_time, 3)
-                self.results[task_id] = {"value": "CAPTCHA_FAIL", "elapsed_time": elapsed_time}
-                self._save_results()
-                logger.error(
-                    f"Browser {index}: Embedded Turnstile failed in "
-                    f"{COLORS.get('RED')}{elapsed_time}{COLORS.get('RESET')}s"
+                payload = await self._build_failure_payload(
+                    elapsed_time=elapsed_time,
+                    reason="embedded_no_token_after_attempts",
+                    page=page,
+                    extra={
+                        "attempts": 10,
+                        "url_initial": url_with_slash,
+                        "sitekey": sitekey,
+                    },
                 )
+                self.results[task_id] = payload
+                self._save_results()
+                self._log_failure_payload(index, task_id, payload)
 
         try:
             if solve_timeout is not None:
@@ -649,23 +817,37 @@ class TurnstileAPIServer:
                 await _run_embedded()
         except asyncio.TimeoutError:
             elapsed_time = round(time.time() - start_time, 3)
-            self.results[task_id] = {
-                "value": "CAPTCHA_FAIL",
-                "elapsed_time": elapsed_time,
-                "reason": "solve_timeout",
-                "timeout_seconds": solve_timeout,
-                "message": f"Solve exceeded time limit of {solve_timeout} second(s).",
-            }
+            payload = await self._build_failure_payload(
+                elapsed_time=elapsed_time,
+                reason="solve_timeout",
+                extra={
+                    "timeout_seconds": solve_timeout,
+                    "message": f"Solve exceeded time limit of {solve_timeout} second(s).",
+                    "sitekey": sitekey,
+                    "url_initial": url,
+                },
+            )
+            self.results[task_id] = payload
             self._save_results()
-            logger.error(f"Browser {index}: Embedded solve timeout (limit {solve_timeout}s)")
+            self._log_failure_payload(index, task_id, payload)
         except Exception as e:
             elapsed_time = round(time.time() - start_time, 3)
-            self.results[task_id] = {"value": "CAPTCHA_FAIL", "elapsed_time": elapsed_time}
+            payload = await self._build_failure_payload(
+                elapsed_time=elapsed_time,
+                reason="embedded_solver_exception",
+                extra={
+                    "error": self._trim_text(e, 320),
+                    "sitekey": sitekey,
+                    "url_initial": url,
+                },
+            )
+            self.results[task_id] = payload
             self._save_results()
             logger.exception(f"Browser {index}: Embedded solve error: {str(e)}")
         finally:
             if context is not None:
                 try:
+                    await self._delay_before_close(index)
                     await context.close()
                 except Exception:
                     pass
@@ -852,6 +1034,7 @@ class TurnstileAPIServer:
                         pass
 
                     if sess.get("cookie_header"):
+                        failure_reason = "partial_session_cookies_only"
                         sess["value"] = ""
                         sess["turnstile_token"] = None
                         sess["note"] = (
@@ -863,20 +1046,30 @@ class TurnstileAPIServer:
                             f"{COLORS.get('GREEN')}{elapsed_time}{COLORS.get('RESET')}s — {page.url}"
                         )
                     else:
-                        logger.error(
-                            f"Browser {index}: No Turnstile token or cookies in {COLORS.get('RED')}{elapsed_time}{COLORS.get('RESET')}s"
+                        diagnostics = await self._collect_page_diagnostics(page)
+                        reason = self._classify_solve_failure_reason(diagnostics, sess.get("cookies") or [])
+                        failure_payload = await self._build_failure_payload(
+                            elapsed_time=elapsed_time,
+                            reason=reason,
+                            page=page,
+                            cookies=sess.get("cookies") or [],
+                            extra={
+                                "url_initial": page_url,
+                                "request_headers": sess.get("request_headers"),
+                                "response_headers": sess.get("response_headers"),
+                                "set_cookie_headers": sess.get("set_cookie_headers"),
+                            },
                         )
+                        self.results[task_id] = failure_payload
+                        self._save_results()
+                        self._log_failure_payload(index, task_id, failure_payload)
+                        return
 
                     self.results[task_id] = sess
                     self._save_results()
                 else:
                     if session_via_dl and not turnstile_check:
-                        await asyncio.sleep(0.3)
-                        try:
-                            await page.reload(wait_until="domcontentloaded", timeout=90000)
-                        except Exception:
-                            pass
-                        await asyncio.sleep(0.35)
+                        await asyncio.sleep(0.1)
                     else:
                         try:
                             await page.wait_for_load_state("networkidle", timeout=20000)
@@ -927,7 +1120,18 @@ class TurnstileAPIServer:
 
             except Exception as e:
                 elapsed_time = round(time.time() - start_time, 3)
-                self.results[task_id] = {"value": "CAPTCHA_FAIL", "elapsed_time": elapsed_time}
+                payload = await self._build_failure_payload(
+                    elapsed_time=elapsed_time,
+                    reason="solver_exception",
+                    page=page if 'page' in locals() else None,
+                    extra={
+                        "url_initial": page_url if 'page_url' in locals() else url,
+                        "error": self._trim_text(e, 320),
+                    },
+                )
+                self.results[task_id] = payload
+                self._save_results()
+                self._log_failure_payload(index, task_id, payload)
                 logger.exception(f"Browser {index}: Error solving Turnstile: {str(e)}")
 
         try:
@@ -937,23 +1141,24 @@ class TurnstileAPIServer:
                 await _run_solve()
         except asyncio.TimeoutError:
             elapsed_time = round(time.time() - start_time, 3)
-            self.results[task_id] = {
-                "value": "CAPTCHA_FAIL",
-                "elapsed_time": elapsed_time,
-                "reason": "solve_timeout",
-                "timeout_seconds": solve_timeout,
-                "message": f"Solve exceeded time limit of {solve_timeout} second(s).",
-            }
-            self._save_results()
-            logger.error(
-                f"Browser {index}: Solve timeout after {COLORS.get('RED')}{elapsed_time}{COLORS.get('RESET')}s "
-                f"(limit {solve_timeout}s)"
+            payload = await self._build_failure_payload(
+                elapsed_time=elapsed_time,
+                reason="solve_timeout",
+                extra={
+                    "timeout_seconds": solve_timeout,
+                    "message": f"Solve exceeded time limit of {solve_timeout} second(s).",
+                    "url_initial": url,
+                },
             )
+            self.results[task_id] = payload
+            self._save_results()
+            self._log_failure_payload(index, task_id, payload)
         finally:
             if self.debug:
                 logger.debug(f"Browser {index}: Clearing page state")
             if context is not None:
                 try:
+                    await self._delay_before_close(index)
                     await context.close()
                 except Exception:
                     pass
@@ -1015,6 +1220,20 @@ class TurnstileAPIServer:
 
         task_id = str(uuid.uuid4())
         self.results[task_id] = "CAPTCHA_NOT_READY"
+        logger.info(
+            "Turnstile request accepted | task_id=%s url=%s sitekey=%s browser=%s headless=%s timeout=%s "
+            "proxy_override=%s reverse_proxy=%s reverse_proxy_style=%s thread=%s",
+            task_id,
+            self._trim_text(url, 180),
+            "provided" if sitekey else "none",
+            self.browser_type,
+            self.headless,
+            solve_timeout,
+            proxy_cfg_override.get("server") if proxy_cfg_override else None,
+            reverse_proxy_base or None,
+            reverse_proxy_style_effective,
+            self.thread_count,
+        )
 
         try:
             self.app.add_background_task(
@@ -1034,7 +1253,7 @@ class TurnstileAPIServer:
                 logger.debug(f"Request completed with taskid {task_id}.")
             return jsonify({"task_id": task_id}), 202
         except Exception as e:
-            logger.error(f"Unexpected error processing request: {str(e)}")
+            logger.exception(f"Unexpected error processing request task_id={task_id}: {str(e)}")
             return jsonify({
                 "status": "error",
                 "error": str(e)
@@ -1052,6 +1271,13 @@ class TurnstileAPIServer:
 
         if isinstance(result, dict) and result.get("value") == "CAPTCHA_FAIL":
             status_code = 422
+            logger.warning(
+                "Turnstile result failure | task_id=%s reason=%s message=%s elapsed=%s",
+                task_id,
+                result.get("reason"),
+                result.get("message"),
+                result.get("elapsed_time"),
+            )
 
         return result, status_code
 
@@ -1076,11 +1302,28 @@ def parse_args():
     parser.add_argument('--proxy', action='store_true', help='Pick a random proxy from proxies.txt for each solve')
     parser.add_argument('--host', type=str, default='127.0.0.1', help='Specify the IP address where the API solver runs. (Default: 127.0.0.1)')
     parser.add_argument('--port', type=str, default='5000', help='Set the port for the API solver to listen on. (Default: 5000)')
+    parser.add_argument('--close-delay', type=float, default=0, help='Keep the browser page open for this many seconds after success or failure before cleanup.')
     return parser.parse_args()
 
 
-def create_app(headless: bool, useragent: str, debug: bool, browser_type: str, thread: int, proxy_support: bool) -> Quart:
-    server = TurnstileAPIServer(headless=headless, useragent=useragent, debug=debug, browser_type=browser_type, thread=thread, proxy_support=proxy_support)
+def create_app(
+    headless: bool,
+    useragent: str,
+    debug: bool,
+    browser_type: str,
+    thread: int,
+    proxy_support: bool,
+    close_delay: float = 0,
+) -> Quart:
+    server = TurnstileAPIServer(
+        headless=headless,
+        useragent=useragent,
+        debug=debug,
+        browser_type=browser_type,
+        thread=thread,
+        proxy_support=proxy_support,
+        close_delay=close_delay,
+    )
     return server.app
 
 
@@ -1101,5 +1344,17 @@ if __name__ == '__main__':
         else:
             logger.error(f"You must specify a {COLORS.get('YELLOW')}User-Agent{COLORS.get('RESET')} for Turnstile Solver when using headless mode")
     else:
-        app = create_app(headless=args.headless, debug=args.debug, useragent=args.useragent, browser_type=args.browser_type, thread=args.thread, proxy_support=args.proxy)
-        app.run(host=args.host, port=int(args.port))
+        app = create_app(
+            headless=args.headless,
+            debug=args.debug,
+            useragent=args.useragent,
+            browser_type=args.browser_type,
+            thread=args.thread,
+            proxy_support=args.proxy,
+            close_delay=args.close_delay,
+        )
+        # Disable Quart's development file watcher in Docker. The watcher has
+        # crashed this long-running solver with `PosixPath object is not
+        # callable`, which resets API calls while the caller is waiting for the
+        # first Turnstile session to be cached.
+        app.run(host=args.host, port=int(args.port), use_reloader=False)
