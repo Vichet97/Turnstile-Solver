@@ -7,6 +7,7 @@ import random
 import logging
 import asyncio
 import argparse
+import re
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse, unquote, urlunparse
 
@@ -261,6 +262,22 @@ class TurnstileAPIServer:
         # target-domain cookies are accepted and can be captured by the solver.
         try:
             response = await route.fetch(url=nu, timeout=60000)
+            if req.resource_type == "document" and host.endswith("goplay.ml") and response.status >= 400:
+                body = await response.body()
+                headers = dict(response.headers)
+                headers["x-turnstile-upstream-status"] = str(response.status)
+                headers["x-turnstile-upstream-url"] = nu
+                if self.debug:
+                    logger.warning(
+                        f"Browser {browser_index}: reverse_proxy document status rewrite "
+                        f"{response.status} -> 200 for {u[:120]}{'…' if len(u) > 120 else ''}"
+                    )
+                await route.fulfill(
+                    status=200,
+                    headers=headers,
+                    body=body,
+                )
+                return
             await route.fulfill(response=response)
             return
         except Exception as e:
@@ -621,10 +638,12 @@ class TurnstileAPIServer:
 
     def _log_failure_payload(self, browser_index: int, task_id: str, payload: Dict[str, Any]) -> None:
         page = payload.get("page") or {}
+        ip_preflight = payload.get("ip_preflight") or {}
         logger.error(
             "Browser %s: Solve rejected | task_id=%s reason=%s message=%s final_url=%s title=%s "
             "nav_status=%s nav_status_text=%s nav_failure=%s widget_count=%s iframe_count=%s "
-            "cookies=%s d_cookie=%s locl_cookie=%s cf_clearance=%s body_excerpt=%s",
+            "cookies=%s d_cookie=%s locl_cookie=%s cf_clearance=%s "
+            "preflight_status=%s preflight_ip=%s preflight_error=%s body_excerpt=%s",
             browser_index,
             task_id,
             payload.get("reason"),
@@ -640,6 +659,9 @@ class TurnstileAPIServer:
             payload.get("d_cookie_present"),
             payload.get("locl_cookie_present"),
             payload.get("cf_clearance_present"),
+            ip_preflight.get("status"),
+            ip_preflight.get("ip") or "",
+            ip_preflight.get("error") or "",
             page.get("body_excerpt") or "",
         )
 
@@ -656,6 +678,92 @@ class TurnstileAPIServer:
         except Exception:
             return ""
         return ""
+
+    @staticmethod
+    def _extract_ip_value(text: Any) -> str:
+        raw = " ".join(str(text or "").split())
+        if not raw:
+            return ""
+        json_match = re.search(r'"ip"\s*:\s*"([^"]+)"', raw, re.IGNORECASE)
+        if json_match:
+            return json_match.group(1).strip()
+        ipv4_match = re.search(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", raw)
+        if ipv4_match:
+            return ipv4_match.group(0)
+        ipv6_match = re.search(r"\b(?:[0-9a-f]{1,4}:){2,}[0-9a-f:]{1,4}\b", raw, re.IGNORECASE)
+        if ipv6_match:
+            return ipv6_match.group(0)
+        return ""
+
+    async def _run_ip_preflight(
+        self,
+        page,
+        browser_index: int,
+        reverse_proxy_base: Optional[str] = None,
+        reverse_proxy_style: str = "host",
+    ) -> Dict[str, Any]:
+        preflight_url = self._normalize_page_url(
+            os.environ.get("TURNSTILE_IP_PREFLIGHT_URL") or "https://api64.ipify.org?format=json"
+        )
+        started_at = time.time()
+        result: Dict[str, Any] = {
+            "enabled": True,
+            "url_initial": preflight_url,
+            "routing": "reverse_proxy" if reverse_proxy_base else "direct",
+            "reverse_proxy": reverse_proxy_base or "",
+            "reverse_proxy_style": reverse_proxy_style if reverse_proxy_style in ("full", "host") else "host",
+        }
+        try:
+            response = await page.goto(preflight_url, wait_until="domcontentloaded", timeout=30000)
+            await page.wait_for_load_state("domcontentloaded")
+            await asyncio.sleep(0.25)
+            body_text = await page.evaluate(
+                "() => (document.body && document.body.innerText) || "
+                "(document.documentElement && document.documentElement.innerText) || ''"
+            )
+            result["elapsed_time"] = round(time.time() - started_at, 3)
+            result["status"] = response.status if response else None
+            try:
+                result["status_text"] = response.status_text if response else ""
+            except Exception:
+                result["status_text"] = ""
+            try:
+                result["url_final"] = page.url
+            except Exception:
+                result["url_final"] = preflight_url
+            result["body_excerpt"] = self._trim_text(body_text, 160)
+            result["ip"] = self._extract_ip_value(body_text)
+            logger.info(
+                "Browser %s: IP preflight | routing=%s reverse_proxy=%s reverse_proxy_style=%s "
+                "status=%s status_text=%s ip=%s final_url=%s body_excerpt=%s",
+                browser_index,
+                result["routing"],
+                result["reverse_proxy"] or "direct",
+                result["reverse_proxy_style"],
+                result.get("status"),
+                result.get("status_text") or "",
+                result.get("ip") or "",
+                result.get("url_final") or "",
+                result.get("body_excerpt") or "",
+            )
+        except Exception as e:
+            result["elapsed_time"] = round(time.time() - started_at, 3)
+            result["error"] = self._trim_text(e, 240)
+            try:
+                result["url_final"] = page.url
+            except Exception:
+                result["url_final"] = preflight_url
+            logger.warning(
+                "Browser %s: IP preflight failed | routing=%s reverse_proxy=%s reverse_proxy_style=%s "
+                "final_url=%s error=%s",
+                browser_index,
+                result["routing"],
+                result["reverse_proxy"] or "direct",
+                result["reverse_proxy_style"],
+                result.get("url_final") or "",
+                result.get("error") or "",
+            )
+        return result
 
     @staticmethod
     def _load_results():
@@ -923,6 +1031,7 @@ class TurnstileAPIServer:
                     await self._reverse_proxy_route_handler(route, rev_base, rev_style, index)
 
                 await page.route("**/*", _rp_route)
+            ip_preflight = await self._run_ip_preflight(page, index, rev_base, rev_style)
             set_cookie_headers: List[str] = []
             last_document_request_headers: Dict[str, str] = {}
             last_document_response_headers: Dict[str, str] = {}
@@ -1072,6 +1181,7 @@ class TurnstileAPIServer:
                         sess["request_headers"] = req_snap
                         sess["response_headers"] = dict(last_document_response_headers)
                         sess["set_cookie_headers"] = list(set_cookie_headers)
+                        sess["ip_preflight"] = ip_preflight
                         self._attach_http_capture(sess, dict(last_document_request_headers), last_document_request_body)
                     except Exception:
                         pass
@@ -1105,6 +1215,7 @@ class TurnstileAPIServer:
                                 "request_headers": sess.get("request_headers"),
                                 "response_headers": sess.get("response_headers"),
                                 "set_cookie_headers": sess.get("set_cookie_headers"),
+                                "ip_preflight": ip_preflight,
                             },
                         )
                         self.results[task_id] = failure_payload
@@ -1153,6 +1264,7 @@ class TurnstileAPIServer:
                         "request_headers": req_hdrs,
                         "response_headers": dict(last_document_response_headers),
                         "set_cookie_headers": list(set_cookie_headers),
+                        "ip_preflight": ip_preflight,
                     }
                     if session_via_dl and not turnstile_check:
                         payload["turnstile_token"] = None
@@ -1178,6 +1290,7 @@ class TurnstileAPIServer:
                         "document_response_url": last_document_url[0] if 'last_document_url' in locals() else "",
                         "document_failure_text": last_document_failure_text[0] if 'last_document_failure_text' in locals() else "",
                         "error": self._trim_text(e, 320),
+                        "ip_preflight": ip_preflight if 'ip_preflight' in locals() else None,
                     },
                 )
                 self.results[task_id] = payload
