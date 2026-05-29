@@ -10,6 +10,8 @@ import argparse
 import re
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse, unquote, urlunparse
+from urllib import request as urllib_request
+from urllib import error as urllib_error
 
 from quart import Quart, request, jsonify
 from patchright.async_api import async_playwright
@@ -261,29 +263,29 @@ class TurnstileAPIServer:
         # original route keeps the browser-visible response scoped to the original URL, so the
         # target-domain cookies are accepted and can be captured by the solver.
         try:
-            response = await route.fetch(url=nu, timeout=60000)
-            if req.resource_type == "document" and host.endswith("goplay.ml") and response.status >= 400:
-                text_body = await response.text()
-                headers = dict(response.headers)
+            if req.resource_type == "document" and host.endswith("goplay.ml"):
+                upstream = await self._fetch_reverse_proxy_document(nu, req)
+                headers = dict(upstream.get("headers") or {})
                 headers.pop("content-encoding", None)
                 headers.pop("Content-Encoding", None)
                 headers.pop("content-length", None)
                 headers.pop("Content-Length", None)
                 headers["content-type"] = headers.get("content-type") or headers.get("Content-Type") or "text/html; charset=UTF-8"
-                headers["x-turnstile-upstream-status"] = str(response.status)
+                headers["x-turnstile-upstream-status"] = str(upstream.get("status"))
                 headers["x-turnstile-upstream-url"] = nu
                 if self.debug:
                     logger.warning(
-                        f"Browser {browser_index}: reverse_proxy document status rewrite "
-                        f"{response.status} -> 200 for {u[:120]}{'…' if len(u) > 120 else ''} "
-                        f"body_excerpt={self._trim_text(text_body, 180)}"
+                        f"Browser {browser_index}: reverse_proxy document manual fetch "
+                        f"{upstream.get('status')} -> 200 for {u[:120]}{'…' if len(u) > 120 else ''} "
+                        f"body_excerpt={self._trim_text(upstream.get('text') or '', 180)}"
                     )
                 await route.fulfill(
                     status=200,
                     headers=headers,
-                    body=text_body,
+                    body=upstream.get("text") or "",
                 )
                 return
+            response = await route.fetch(url=nu, timeout=60000)
             await route.fulfill(response=response)
             return
         except Exception as e:
@@ -300,6 +302,65 @@ class TurnstileAPIServer:
                 await route.continue_(url=nu)
             except Exception:
                 pass
+
+    @staticmethod
+    def _decode_http_body(body: bytes, content_type: str) -> str:
+        charset = "utf-8"
+        match = re.search(r"charset=([^\s;]+)", content_type or "", re.IGNORECASE)
+        if match:
+            charset = match.group(1).strip(' "\'')
+        try:
+            return body.decode(charset, errors="replace")
+        except Exception:
+            try:
+                return body.decode("utf-8", errors="replace")
+            except Exception:
+                return ""
+
+    async def _fetch_reverse_proxy_document(self, url: str, req) -> Dict[str, Any]:
+        method = (getattr(req, "method", None) or "GET").upper()
+        req_headers = {}
+        try:
+            source_headers = dict(getattr(req, "headers", {}) or {})
+        except Exception:
+            source_headers = {}
+        for key, value in source_headers.items():
+            lower = str(key).lower()
+            if lower in {"host", "connection", "content-length", "accept-encoding"}:
+                continue
+            req_headers[str(key)] = str(value)
+        req_headers["Accept-Encoding"] = "identity"
+        data = None
+        try:
+            post_data = getattr(req, "post_data", None)
+            if post_data:
+                data = post_data.encode("utf-8") if isinstance(post_data, str) else post_data
+        except Exception:
+            data = None
+
+        def _do_fetch() -> Dict[str, Any]:
+            request_obj = urllib_request.Request(url, headers=req_headers, method=method, data=data)
+            try:
+                with urllib_request.urlopen(request_obj, timeout=60) as response:
+                    raw = response.read()
+                    headers = dict(response.headers.items())
+                    content_type = headers.get("Content-Type") or headers.get("content-type") or ""
+                    return {
+                        "status": getattr(response, "status", 200),
+                        "headers": headers,
+                        "text": self._decode_http_body(raw, content_type),
+                    }
+            except urllib_error.HTTPError as e:
+                raw = e.read()
+                headers = dict(e.headers.items()) if e.headers else {}
+                content_type = headers.get("Content-Type") or headers.get("content-type") or ""
+                return {
+                    "status": getattr(e, "code", 599),
+                    "headers": headers,
+                    "text": self._decode_http_body(raw, content_type),
+                }
+
+        return await asyncio.to_thread(_do_fetch)
 
     _PROXY_SCHEMES = frozenset(("http", "https", "socks5", "socks4"))
 
