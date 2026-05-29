@@ -623,13 +623,17 @@ class TurnstileAPIServer:
         page = payload.get("page") or {}
         logger.error(
             "Browser %s: Solve rejected | task_id=%s reason=%s message=%s final_url=%s title=%s "
-            "widget_count=%s iframe_count=%s cookies=%s d_cookie=%s locl_cookie=%s cf_clearance=%s body_excerpt=%s",
+            "nav_status=%s nav_status_text=%s nav_failure=%s widget_count=%s iframe_count=%s "
+            "cookies=%s d_cookie=%s locl_cookie=%s cf_clearance=%s body_excerpt=%s",
             browser_index,
             task_id,
             payload.get("reason"),
             payload.get("message"),
             page.get("url") or payload.get("url_final") or "",
             page.get("title") or "",
+            payload.get("document_response_status"),
+            payload.get("document_response_status_text"),
+            payload.get("document_failure_text"),
             page.get("widget_count"),
             page.get("iframe_count"),
             payload.get("cookie_names") or [],
@@ -638,6 +642,20 @@ class TurnstileAPIServer:
             payload.get("cf_clearance_present"),
             page.get("body_excerpt") or "",
         )
+
+    @staticmethod
+    def _request_failure_text(request_obj) -> str:
+        try:
+            failure = getattr(request_obj, "failure", None)
+            if callable(failure):
+                failure = failure()
+            if isinstance(failure, dict):
+                return str(failure.get("errorText") or failure.get("error") or "").strip()
+            if failure:
+                return str(failure).strip()
+        except Exception:
+            return ""
+        return ""
 
     @staticmethod
     def _load_results():
@@ -909,6 +927,10 @@ class TurnstileAPIServer:
             last_document_request_headers: Dict[str, str] = {}
             last_document_response_headers: Dict[str, str] = {}
             last_document_request_body: List[Optional[str]] = [None]
+            last_document_status: List[Optional[int]] = [None]
+            last_document_status_text: List[str] = [""]
+            last_document_url: List[str] = [""]
+            last_document_failure_text: List[str] = [""]
 
             def _on_response(response):
                 try:
@@ -922,6 +944,15 @@ class TurnstileAPIServer:
                         last_document_request_headers.update(dict(req.headers))
                         last_document_response_headers.clear()
                         last_document_response_headers.update(dict(h))
+                        last_document_status[0] = response.status
+                        try:
+                            last_document_status_text[0] = response.status_text
+                        except Exception:
+                            last_document_status_text[0] = ""
+                        try:
+                            last_document_url[0] = response.url
+                        except Exception:
+                            last_document_url[0] = ""
                         try:
                             last_document_request_body[0] = req.post_data
                         except Exception:
@@ -929,7 +960,19 @@ class TurnstileAPIServer:
                 except Exception:
                     pass
 
+            def _on_request_failed(req):
+                try:
+                    if getattr(req, "resource_type", None) == "document":
+                        last_document_failure_text[0] = self._request_failure_text(req)
+                        try:
+                            last_document_url[0] = req.url
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+
             page.on("response", _on_response)
+            page.on("requestfailed", _on_request_failed)
 
             page_url = self._normalize_page_url(url)
 
@@ -1055,6 +1098,10 @@ class TurnstileAPIServer:
                             cookies=sess.get("cookies") or [],
                             extra={
                                 "url_initial": page_url,
+                                "document_response_status": last_document_status[0],
+                                "document_response_status_text": last_document_status_text[0],
+                                "document_response_url": last_document_url[0],
+                                "document_failure_text": last_document_failure_text[0],
                                 "request_headers": sess.get("request_headers"),
                                 "response_headers": sess.get("response_headers"),
                                 "set_cookie_headers": sess.get("set_cookie_headers"),
@@ -1126,6 +1173,10 @@ class TurnstileAPIServer:
                     page=page if 'page' in locals() else None,
                     extra={
                         "url_initial": page_url if 'page_url' in locals() else url,
+                        "document_response_status": last_document_status[0] if 'last_document_status' in locals() else None,
+                        "document_response_status_text": last_document_status_text[0] if 'last_document_status_text' in locals() else "",
+                        "document_response_url": last_document_url[0] if 'last_document_url' in locals() else "",
+                        "document_failure_text": last_document_failure_text[0] if 'last_document_failure_text' in locals() else "",
                         "error": self._trim_text(e, 320),
                     },
                 )
