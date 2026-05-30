@@ -36,12 +36,14 @@ stop_xrdp_services() {
 }
 
 configure_root_password() {
+    local root_password
+    root_password="${XRDP_PASSWORD:-${ROOT_PASSWORD:-root}}"
     if [ "$IS_ROOT" -ne 1 ]; then
         echo "Non-root runtime (uid=$CURRENT_UID): skipping root password setup."
         return
     fi
     if id "root" &>/dev/null; then
-        echo "root:root" | chpasswd || {
+        echo "root:${root_password}" | chpasswd || {
             echo "Failed to update root password, continuing..."
         }
     else
@@ -51,7 +53,7 @@ configure_root_password() {
         useradd -m -s /bin/bash -g root root || {
             echo "Failed to create root user, continuing..."
         }
-        echo "root:root" | chpasswd || {
+        echo "root:${root_password}" | chpasswd || {
             echo "Failed to set root password, continuing..."
         }
         usermod -aG sudo root || {
@@ -128,12 +130,47 @@ prefetch_seleniumbase_drivers() {
     fi
 }
 
+find_xrdp_display() {
+    ps -eo args | awk '
+        /[Xx]org/ && /xrdp/ {
+            for (i = 1; i <= NF; i++) {
+                if ($i ~ /^:[0-9]+(\.[0-9]+)?$/) {
+                    split($i, parts, ".")
+                    print parts[1]
+                    exit
+                }
+            }
+        }
+    '
+}
+
+wait_for_xrdp_display() {
+    local timeout waited display
+    timeout="${1:-0}"
+    waited=0
+    while true; do
+        display="$(find_xrdp_display || true)"
+        if [ -n "$display" ]; then
+            echo "$display"
+            return 0
+        fi
+        if [ "$timeout" -gt 0 ] && [ "$waited" -ge "$timeout" ]; then
+            return 1
+        fi
+        sleep 1
+        waited=$((waited + 1))
+    done
+}
+
 configure_root_password
 configure_timezone
 
 if [ "${RUN_API_SOLVER:-false}" = "true" ]; then
     echo "Starting API solver with virtual display..."
     ENABLE_RDP_WITH_API="${ENABLE_RDP_WITH_API:-false}"
+    SOLVER_DISPLAY_MODE="${SOLVER_DISPLAY_MODE:-xvfb}"
+    SOLVER_DISPLAY_MODE_LC="$(echo "$SOLVER_DISPLAY_MODE" | tr '[:upper:]' '[:lower:]')"
+    RDP_SESSION_WAIT_SECONDS="${RDP_SESSION_WAIT_SECONDS:-0}"
     SOLVER_BROWSER_TYPE="${SOLVER_BROWSER_TYPE:-seleniumbase}"
     SOLVER_THREAD="${SOLVER_THREAD:-1}"
     XVFB_SCREEN_WIDTH="${XVFB_SCREEN_WIDTH:-1920}"
@@ -163,15 +200,44 @@ if [ "${RUN_API_SOLVER:-false}" = "true" ]; then
         SOLVER_DEBUG_ARGS="--debug"
     fi
 
-    API_CMD=(xvfb-run -a --error-file=/tmp/xvfb-errors.log --server-args="$XVFB_SERVER_ARGS" python api_solver.py --browser_type "$SOLVER_BROWSER_TYPE" --thread "$SOLVER_THREAD" --host 0.0.0.0)
+    BASE_API_CMD=(python api_solver.py --browser_type "$SOLVER_BROWSER_TYPE" --thread "$SOLVER_THREAD" --host 0.0.0.0)
     if [ -n "$SOLVER_HEADLESS_ARGS" ]; then
-        API_CMD+=("$SOLVER_HEADLESS_ARGS")
+        BASE_API_CMD+=("$SOLVER_HEADLESS_ARGS")
     fi
     if [ -n "${SOLVER_USERAGENT:-}" ]; then
-        API_CMD+=(--useragent "$SOLVER_USERAGENT")
+        BASE_API_CMD+=(--useragent "$SOLVER_USERAGENT")
     fi
     if [ -n "$SOLVER_DEBUG_ARGS" ]; then
-        API_CMD+=("$SOLVER_DEBUG_ARGS")
+        BASE_API_CMD+=("$SOLVER_DEBUG_ARGS")
+    fi
+
+    USE_XVFB=1
+    if [ "$SOLVER_DISPLAY_MODE_LC" = "rdp" ] || [ "$SOLVER_DISPLAY_MODE_LC" = "auto" ]; then
+        if [ "$ENABLE_RDP_WITH_API" = "true" ] && [ "$IS_ROOT" -eq 1 ]; then
+            DISPLAY_FOR_API=""
+            if DISPLAY_FOR_API="$(wait_for_xrdp_display "$RDP_SESSION_WAIT_SECONDS")"; then
+                :
+            elif [ "$SOLVER_DISPLAY_MODE_LC" = "rdp" ]; then
+                echo "No active XRDP display detected in ${RDP_SESSION_WAIT_SECONDS}s. Waiting until an RDP session starts..."
+                DISPLAY_FOR_API="$(wait_for_xrdp_display 0)"
+            fi
+
+            if [ -n "$DISPLAY_FOR_API" ]; then
+                export DISPLAY="$DISPLAY_FOR_API"
+                export XAUTHORITY="${XAUTHORITY:-$HOME/.Xauthority}"
+                echo "Using XRDP display ${DISPLAY} for browser windows."
+                API_CMD=("${BASE_API_CMD[@]}")
+                USE_XVFB=0
+            else
+                echo "No XRDP display found; using Xvfb mode."
+            fi
+        else
+            echo "SOLVER_DISPLAY_MODE=${SOLVER_DISPLAY_MODE_LC} requested, but XRDP is not active/root-capable. Using Xvfb mode."
+        fi
+    fi
+
+    if [ "$USE_XVFB" -eq 1 ]; then
+        API_CMD=(xvfb-run -a --error-file=/tmp/xvfb-errors.log --server-args="$XVFB_SERVER_ARGS" "${BASE_API_CMD[@]}")
     fi
 
     "${API_CMD[@]}"

@@ -90,6 +90,12 @@ You can tune virtual display and browser viewport via env vars:
 - `SELENIUMBASE_PREWARM` (default `true`)
 - `SELENIUMBASE_PREFETCH_DRIVER` (default `true`)
 - `SELENIUMBASE_UC` optional override (`true` / `false`; default `false` for Docker stability)
+- `SELENIUMBASE_GUI_CLICK` optional (`false` recommended unless `python3-tk` is installed)
+- `SOLVER_DISPLAY_MODE` (`xvfb` default, `rdp` to render headed browser windows in XRDP session, `auto` to prefer XRDP if present)
+- `RDP_SESSION_WAIT_SECONDS` (`0` = wait indefinitely for XRDP session when `SOLVER_DISPLAY_MODE=rdp`)
+- `XRDP_PASSWORD` (sets root password used for XRDP login; default `root`)
+
+The Docker image now installs `python3-tk` and `python3-dev` to avoid MouseInfo/tkinter `SystemExit` crashes when SeleniumBase GUI-click helpers are enabled.
 
 Recommended baseline for Turnstile visibility:
 - `1920x1080`, depth `24`, `96 DPI`, `SOLVER_DEVICE_SCALE_FACTOR=1.0`

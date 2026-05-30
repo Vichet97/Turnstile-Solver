@@ -134,6 +134,7 @@ class TurnstileAPIServer:
         self.browser_pool = asyncio.Queue()
         self.browser_runtimes: List[Any] = []
         self.browser_args = ["--disable-blink-features=AutomationControlled"]
+        self._seleniumbase_gui_click_blocked = False
         if useragent:
             self.browser_args.append(f"--user-agent={useragent}")
 
@@ -1428,14 +1429,28 @@ class TurnstileAPIServer:
         return [c for c in (cookies or []) if _cookie_matches(c.get("domain", ""))]
 
     def _seleniumbase_click_turnstile(self, driver) -> None:
-        if not self.headless:
+        if not self.headless and self._seleniumbase_gui_click_enabled():
             for method_name in ("uc_gui_click_cf", "uc_gui_click_captcha"):
                 method = getattr(driver, method_name, None)
                 if callable(method):
                     try:
                         method()
                         return
-                    except Exception:
+                    except BaseException as e:
+                        msg = self._trim_text(e, 240)
+                        if isinstance(e, SystemExit):
+                            self._seleniumbase_gui_click_blocked = True
+                            logger.warning(
+                                "SeleniumBase GUI click disabled for this process after SystemExit from %s: %s",
+                                method_name,
+                                msg,
+                            )
+                        elif self.debug:
+                            logger.debug(
+                                "SeleniumBase GUI click method failed (%s): %s",
+                                method_name,
+                                msg,
+                            )
                         pass
 
         click_script = """
@@ -1459,6 +1474,17 @@ class TurnstileAPIServer:
             driver.execute_script(click_script)
         except Exception:
             pass
+
+    def _seleniumbase_gui_click_enabled(self) -> bool:
+        if self._seleniumbase_gui_click_blocked:
+            return False
+        raw = (os.environ.get("SELENIUMBASE_GUI_CLICK") or "").strip().lower()
+        if raw in {"1", "true", "yes", "on"}:
+            return True
+        if raw in {"0", "false", "no", "off"}:
+            return False
+        # Default OFF to avoid MouseInfo/tkinter SystemExit crashes in minimal Docker images.
+        return False
 
     @staticmethod
     def _seleniumbase_read_turnstile_token(driver) -> str:
@@ -1704,7 +1730,14 @@ class TurnstileAPIServer:
                         proxied_doc_error,
                     )
 
-            driver.get(nav_url)
+            if self._seleniumbase_uc_mode() and rev_base:
+                nav_fn = getattr(driver, "default_get", None)
+                if callable(nav_fn):
+                    nav_fn(nav_url)
+                else:
+                    driver.get(nav_url)
+            else:
+                driver.get(nav_url)
             time.sleep(1.5)
             self._seleniumbase_click_turnstile(driver)
 
@@ -1916,24 +1949,45 @@ class TurnstileAPIServer:
                 self._save_results()
                 return
 
-            payload = await asyncio.to_thread(
-                self._solve_turnstile_embedded_seleniumbase_sync,
-                url,
-                sitekey,
-                action,
-                cdata,
-                proxy_cfg,
-                effective_browser_type,
-                solve_timeout,
-                reverse_proxy_base,
-                reverse_proxy_style,
-            )
+            try:
+                payload = await asyncio.to_thread(
+                    self._solve_turnstile_embedded_seleniumbase_sync,
+                    url,
+                    sitekey,
+                    action,
+                    cdata,
+                    proxy_cfg,
+                    effective_browser_type,
+                    solve_timeout,
+                    reverse_proxy_base,
+                    reverse_proxy_style,
+                )
+                if not isinstance(payload, dict):
+                    raise RuntimeError("SeleniumBase embedded solve returned an invalid payload.")
 
-            self.results[task_id] = payload
-            self._save_results()
-            if payload.get("value") == "CAPTCHA_FAIL":
+                self.results[task_id] = payload
+                self._save_results()
+                if payload.get("value") == "CAPTCHA_FAIL":
+                    self._log_failure_payload(0, task_id, payload)
+                return
+            except BaseException as e:
+                elapsed_time = 0.0
+                payload = self._failure_payload_for_seleniumbase(
+                    elapsed_time=elapsed_time,
+                    reason="embedded_solver_exception",
+                    browser_type=effective_browser_type,
+                    extra={
+                        "error": self._trim_text(e, 320),
+                        "url_initial": url,
+                        "sitekey": sitekey,
+                        "reverse_proxy": reverse_proxy_base or "",
+                        "reverse_proxy_style": reverse_proxy_style,
+                    },
+                )
+                self.results[task_id] = payload
+                self._save_results()
                 self._log_failure_payload(0, task_id, payload)
-            return
+                return
 
         index, browser, effective_browser_type, release_browser = await self._acquire_browser(browser_type_override)
 
@@ -2139,21 +2193,40 @@ class TurnstileAPIServer:
                 self._log_failure_payload(0, task_id, payload)
                 return
 
-            payload = await asyncio.to_thread(
-                self._solve_turnstile_seleniumbase_sync,
-                url,
-                proxy_cfg,
-                effective_browser_type,
-                solve_timeout,
-                reverse_proxy_base,
-                reverse_proxy_style,
-            )
+            try:
+                payload = await asyncio.to_thread(
+                    self._solve_turnstile_seleniumbase_sync,
+                    url,
+                    proxy_cfg,
+                    effective_browser_type,
+                    solve_timeout,
+                    reverse_proxy_base,
+                    reverse_proxy_style,
+                )
+                if not isinstance(payload, dict):
+                    raise RuntimeError("SeleniumBase solve returned an invalid payload.")
 
-            self.results[task_id] = payload
-            self._save_results()
-            if payload.get("value") == "CAPTCHA_FAIL":
+                self.results[task_id] = payload
+                self._save_results()
+                if payload.get("value") == "CAPTCHA_FAIL":
+                    self._log_failure_payload(0, task_id, payload)
+                return
+            except BaseException as e:
+                payload = self._failure_payload_for_seleniumbase(
+                    elapsed_time=0.0,
+                    reason="solver_exception",
+                    browser_type=effective_browser_type,
+                    extra={
+                        "error": self._trim_text(e, 320),
+                        "url_initial": url,
+                        "reverse_proxy": reverse_proxy_base or "",
+                        "reverse_proxy_style": reverse_proxy_style,
+                    },
+                )
+                self.results[task_id] = payload
+                self._save_results()
                 self._log_failure_payload(0, task_id, payload)
-            return
+                return
 
         index, browser, effective_browser_type, release_browser = await self._acquire_browser(browser_type_override)
 

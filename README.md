@@ -148,10 +148,13 @@ Virtual GUI defaults for Docker API mode (`RUN_API_SOLVER=true`) are tuned for T
 - `SELENIUMBASE_PREWARM=true` (startup prewarm)
 - `SELENIUMBASE_PREFETCH_DRIVER=true` (prefetch chromedriver/uc_driver in `run.sh`)
 - `SELENIUMBASE_UC` optional override (`true`/`false`, default `false` for stability)
+- `SELENIUMBASE_GUI_CLICK` optional (`false` recommended in Docker unless `python3-tk` is installed)
 
 If you need to view the GUI via RDP while API mode is running, enable:
 - `ENABLE_RDP_WITH_API=true`
 - run container as root (`user: "0:0"` in compose)
+- set `SOLVER_DISPLAY_MODE=rdp` so headed Selenium windows render inside the XRDP session
+- optional: set `XRDP_PASSWORD` (defaults to `root` if unset)
 
 #### Connecting to the Container
 1. Use an **RDP client** (like Windows Remote Desktop, Remmina, or FreeRDP)
