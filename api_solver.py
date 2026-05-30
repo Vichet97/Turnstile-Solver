@@ -793,6 +793,7 @@ class TurnstileAPIServer:
             payload["cf_clearance_present"] = self._has_cookie_name(cookies, "cf_clearance")
         if extra:
             payload.update(extra)
+        payload.setdefault("result_mode", "failure" if payload.get("value") == "CAPTCHA_FAIL" else "unknown")
         return payload
 
     def _log_failure_payload(self, browser_index: int, task_id: str, payload: Dict[str, Any]) -> None:
@@ -943,11 +944,85 @@ class TurnstileAPIServer:
         except IOError as e:
             logger.error(f"Error saving results to file: {str(e)}")
 
+    @staticmethod
+    def _describe_result_payload(task_id: str, result: Any) -> Dict[str, Any]:
+        if result == "CAPTCHA_NOT_READY":
+            return {
+                "task_id": task_id,
+                "status": "pending",
+                "result_mode": "pending",
+            }
+
+        if not isinstance(result, dict):
+            text_value = str(result or "")
+            return {
+                "task_id": task_id,
+                "status": "unknown",
+                "result_mode": "unknown",
+                "has_token": bool(text_value),
+                "token_length": len(text_value),
+            }
+
+        value = result.get("value")
+        cookies = result.get("cookies")
+        cookie_names = result.get("cookie_names")
+        if cookie_names is None and isinstance(cookies, list):
+            cookie_names = [c.get("name") for c in cookies if isinstance(c, dict) and c.get("name")]
+        cookie_names = cookie_names or []
+        has_cookie_header = bool(result.get("cookie_header"))
+        has_request_headers = bool(result.get("request_headers"))
+        has_session_cookies = bool(cookie_names or has_cookie_header)
+        has_token = isinstance(value, str) and len(value.strip()) > 0 and value != "CAPTCHA_FAIL"
+        has_d_cookie = bool(result.get("d_cookie_present")) or ("d" in cookie_names)
+        has_locl_cookie = bool(result.get("locl_cookie_present")) or ("locl" in cookie_names)
+        has_cf_clearance = bool(result.get("cf_clearance_present")) or ("cf_clearance" in cookie_names)
+
+        if result.get("value") == "CAPTCHA_FAIL":
+            status = "failure"
+            result_mode = "failure"
+        elif has_session_cookies:
+            status = "ok"
+            result_mode = "session_captured"
+        elif has_token:
+            status = "ok"
+            result_mode = "token_only"
+        else:
+            status = "unknown"
+            result_mode = "unknown"
+
+        return {
+            "task_id": task_id,
+            "status": status,
+            "result_mode": result_mode,
+            "browser_type": result.get("browser_type"),
+            "browser_backend": result.get("browser_backend"),
+            "elapsed_time": result.get("elapsed_time"),
+            "reason": result.get("reason"),
+            "message": result.get("message"),
+            "has_token": has_token,
+            "token_length": len(value) if isinstance(value, str) else 0,
+            "has_cookie_header": has_cookie_header,
+            "has_request_headers": has_request_headers,
+            "has_session_cookies": has_session_cookies,
+            "cookie_names": cookie_names,
+            "d_cookie_present": has_d_cookie,
+            "locl_cookie_present": has_locl_cookie,
+            "cf_clearance_present": has_cf_clearance,
+            "ip_preflight": result.get("ip_preflight"),
+            "has_turnstile_headers": bool(result.get("turnstile_headers")),
+            "turnstile_request_count": len((result.get("turnstile_headers") or {}).get("requests") or []),
+            "turnstile_response_count": len((result.get("turnstile_headers") or {}).get("responses") or []),
+            "turnstile_failed_count": len((result.get("turnstile_headers") or {}).get("request_failed") or []),
+            "url_initial": result.get("url_initial"),
+            "url_final": result.get("url_final"),
+        }
+
     def _setup_routes(self) -> None:
         """Set up the application routes."""
         self.app.before_serving(self._startup)
         self.app.route('/turnstile', methods=['GET'])(self.process_turnstile)
         self.app.route('/result', methods=['GET'])(self.get_result)
+        self.app.route('/describe', methods=['GET'])(self.describe_result)
 
     async def _startup(self) -> None:
         """Initialize the browser and page pool on startup."""
@@ -1064,6 +1139,7 @@ class TurnstileAPIServer:
                             "elapsed_time": elapsed_time,
                             "browser_type": effective_browser_type,
                             "browser_backend": effective_browser_type,
+                            "result_mode": "token_only",
                         }
                         self._save_results()
                         return
@@ -1201,6 +1277,55 @@ class TurnstileAPIServer:
             last_document_status_text: List[str] = [""]
             last_document_url: List[str] = [""]
             last_document_failure_text: List[str] = [""]
+            turnstile_capture: Dict[str, Any] = {
+                "requests": [],
+                "responses": [],
+                "request_failed": [],
+            }
+            turnstile_seen = {
+                "request_urls": set(),
+                "response_urls": set(),
+                "failed_urls": set(),
+            }
+
+            def _is_turnstile_request(req) -> bool:
+                try:
+                    req_url = str(getattr(req, "url", "") or "")
+                    req_type = str(getattr(req, "resource_type", "") or "")
+                    return (
+                        "challenges.cloudflare.com" in req_url
+                        or "turnstile" in req_url.lower()
+                        or req_type in {"fetch", "xhr", "iframe"}
+                        and "cloudflare" in req_url.lower()
+                    )
+                except Exception:
+                    return False
+
+            def _push_limited(target_list: List[Dict[str, Any]], item: Dict[str, Any], limit: int = 12) -> None:
+                if len(target_list) < limit:
+                    target_list.append(item)
+
+            def _capture_turnstile_request(req) -> None:
+                if not _is_turnstile_request(req):
+                    return
+                try:
+                    req_url = str(req.url)
+                except Exception:
+                    req_url = ""
+                if req_url in turnstile_seen["request_urls"]:
+                    return
+                turnstile_seen["request_urls"].add(req_url)
+                try:
+                    headers = dict(getattr(req, "headers", {}) or {})
+                except Exception:
+                    headers = {}
+                entry = {
+                    "url": req_url,
+                    "method": getattr(req, "method", None),
+                    "resource_type": getattr(req, "resource_type", None),
+                    "headers": headers,
+                }
+                _push_limited(turnstile_capture["requests"], entry)
 
             def _on_response(response):
                 try:
@@ -1227,6 +1352,21 @@ class TurnstileAPIServer:
                             last_document_request_body[0] = req.post_data
                         except Exception:
                             last_document_request_body[0] = None
+                    if _is_turnstile_request(req):
+                        try:
+                            resp_url = str(response.url)
+                        except Exception:
+                            resp_url = ""
+                        if resp_url not in turnstile_seen["response_urls"]:
+                            turnstile_seen["response_urls"].add(resp_url)
+                            _push_limited(turnstile_capture["responses"], {
+                                "url": resp_url,
+                                "status": getattr(response, "status", None),
+                                "status_text": getattr(response, "status_text", ""),
+                                "resource_type": getattr(req, "resource_type", None),
+                                "request_headers": dict(getattr(req, "headers", {}) or {}),
+                                "response_headers": dict(h or {}),
+                            })
                 except Exception:
                     pass
 
@@ -1238,9 +1378,29 @@ class TurnstileAPIServer:
                             last_document_url[0] = req.url
                         except Exception:
                             pass
+                    if _is_turnstile_request(req):
+                        try:
+                            failed_url = str(req.url)
+                        except Exception:
+                            failed_url = ""
+                        if failed_url not in turnstile_seen["failed_urls"]:
+                            turnstile_seen["failed_urls"].add(failed_url)
+                            _push_limited(turnstile_capture["request_failed"], {
+                                "url": failed_url,
+                                "resource_type": getattr(req, "resource_type", None),
+                                "headers": dict(getattr(req, "headers", {}) or {}),
+                                "failure_text": self._request_failure_text(req),
+                            })
                 except Exception:
                     pass
 
+            def _on_request(req):
+                try:
+                    _capture_turnstile_request(req)
+                except Exception:
+                    pass
+
+            page.on("request", _on_request)
             page.on("response", _on_response)
             page.on("requestfailed", _on_request_failed)
 
@@ -1311,6 +1471,7 @@ class TurnstileAPIServer:
                         "url_final": page.url,
                         "browser_type": effective_browser_type,
                         "browser_backend": effective_browser_type,
+                        "result_mode": "failure",
                     }
                     try:
                         cookies = await context.cookies()
@@ -1346,6 +1507,7 @@ class TurnstileAPIServer:
                         sess["response_headers"] = dict(last_document_response_headers)
                         sess["set_cookie_headers"] = list(set_cookie_headers)
                         sess["ip_preflight"] = ip_preflight
+                        sess["turnstile_headers"] = turnstile_capture
                         self._attach_http_capture(sess, dict(last_document_request_headers), last_document_request_body)
                     except Exception:
                         pass
@@ -1380,6 +1542,7 @@ class TurnstileAPIServer:
                                 "response_headers": sess.get("response_headers"),
                                 "set_cookie_headers": sess.get("set_cookie_headers"),
                                 "ip_preflight": ip_preflight,
+                                "turnstile_headers": turnstile_capture,
                             },
                         )
                         self.results[task_id] = failure_payload
@@ -1424,6 +1587,7 @@ class TurnstileAPIServer:
                         "url_final": page.url,
                         "browser_type": effective_browser_type,
                         "browser_backend": effective_browser_type,
+                        "result_mode": "token_only" if turnstile_check else "session_captured",
                         "cookies": cookies,
                         "cookie_header": cookie_header,
                         "d_locl_cookie_header": self._d_locl_cookie_header(cookies),
@@ -1431,6 +1595,7 @@ class TurnstileAPIServer:
                         "response_headers": dict(last_document_response_headers),
                         "set_cookie_headers": list(set_cookie_headers),
                         "ip_preflight": ip_preflight,
+                        "turnstile_headers": turnstile_capture,
                     }
                     if session_via_dl and not turnstile_check:
                         payload["turnstile_token"] = None
@@ -1459,6 +1624,7 @@ class TurnstileAPIServer:
                         "ip_preflight": ip_preflight if 'ip_preflight' in locals() else None,
                         "browser_type": effective_browser_type,
                         "browser_backend": effective_browser_type,
+                        "turnstile_headers": turnstile_capture if 'turnstile_capture' in locals() else None,
                     },
                 )
                 self.results[task_id] = payload
@@ -1623,6 +1789,20 @@ class TurnstileAPIServer:
             )
 
         return result, status_code
+
+    async def describe_result(self):
+        """Return a read-only classification/summary for a solve result."""
+        task_id = request.args.get('id')
+
+        if not task_id or task_id not in self.results:
+            return jsonify({"status": "error", "error": "Invalid task ID/Request parameter"}), 400
+
+        result = self.results[task_id]
+        summary = self._describe_result_payload(task_id, result)
+        status_code = 200
+        if summary.get("result_mode") == "failure":
+            status_code = 422
+        return jsonify(summary), status_code
 
 
 def parse_args():
