@@ -56,7 +56,15 @@ if [ "$RUN_API_SOLVER" = "true" ]; then
     echo "Starting API solver with virtual display..."
     SOLVER_BROWSER_TYPE="${SOLVER_BROWSER_TYPE:-chromium}"
     SOLVER_THREAD="${SOLVER_THREAD:-1}"
-    xvfb-run -a python api_solver.py --browser_type "$SOLVER_BROWSER_TYPE" --thread "$SOLVER_THREAD" --host 0.0.0.0
+    SOLVER_HEADLESS_ARGS=""
+    if [ "${SOLVER_HEADLESS:-false}" = "true" ]; then
+        SOLVER_HEADLESS_ARGS="--headless"
+    fi
+    SOLVER_USERAGENT_ARGS=""
+    if [ -n "$SOLVER_USERAGENT" ]; then
+        SOLVER_USERAGENT_ARGS="--useragent \"$SOLVER_USERAGENT\""
+    fi
+    eval xvfb-run -a python api_solver.py --browser_type "$SOLVER_BROWSER_TYPE" --thread "$SOLVER_THREAD" $SOLVER_HEADLESS_ARGS $SOLVER_USERAGENT_ARGS --host 0.0.0.0
 else
     trap "stop_xrdp_services" SIGKILL SIGTERM SIGHUP SIGINT EXIT
     start_xrdp_services

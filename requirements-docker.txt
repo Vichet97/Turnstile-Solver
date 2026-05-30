@@ -2,3 +2,4 @@ quart
 asyncio
 argparse
 patchright
+playwright

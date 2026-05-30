@@ -72,8 +72,9 @@ COPY . .
 RUN useradd -m -u 1000 appuser && chown -R appuser:appuser /app
 USER appuser
 
-# Install playwright browsers as the non-root user
-RUN python -m patchright install chromium
+# Install browser runtimes as the non-root user
+RUN python -m patchright install chromium && \
+    python -m playwright install chromium
 
 # Expose port 5000
 EXPOSE 5000
