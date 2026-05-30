@@ -14,7 +14,14 @@ from urllib import request as urllib_request
 from urllib import error as urllib_error
 
 from quart import Quart, request, jsonify
-from patchright.async_api import async_playwright
+from patchright.async_api import async_playwright as async_patchright
+
+try:
+    from playwright.async_api import async_playwright as async_playwright_native
+    PLAYWRIGHT_NATIVE_AVAILABLE = True
+except ImportError:
+    async_playwright_native = None
+    PLAYWRIGHT_NATIVE_AVAILABLE = False
 
 # Optional camoufox import
 try:
@@ -65,6 +72,7 @@ logger.addHandler(handler)
 
 
 class TurnstileAPIServer:
+    DEFAULT_SOLVE_TIMEOUT_SECONDS = 45.0
     HTML_TEMPLATE = """
     <!DOCTYPE html>
     <html lang="en">
@@ -114,6 +122,7 @@ class TurnstileAPIServer:
         self.thread_count = thread
         self.proxy_support = proxy_support
         self.browser_pool = asyncio.Queue()
+        self.browser_runtimes: List[Any] = []
         self.browser_args = ["--disable-blink-features=AutomationControlled"]
         if useragent:
             self.browser_args.append(f"--user-agent={useragent}")
@@ -472,6 +481,89 @@ class TurnstileAPIServer:
                     "https:user:pass:host:port, or https://user:pass@host:port), "
                     "or --browser_type camoufox (Firefox)."
                 )
+
+    @staticmethod
+    def _supported_browser_types() -> List[str]:
+        browser_types = ["chromium", "playwright", "chrome", "msedge"]
+        if CAMOUFOX_AVAILABLE:
+            browser_types.append("camoufox")
+        return browser_types
+
+    def _normalize_browser_type(self, browser_type: Optional[str]) -> str:
+        value = (browser_type or self.browser_type or "chromium").strip().lower()
+        if value == "playwrite":
+            value = "playwright"
+        if value not in self._supported_browser_types():
+            raise ValueError(
+                f"Unknown browser type '{value}'. Available browser types: {self._supported_browser_types()}"
+            )
+        if value == "playwright" and not PLAYWRIGHT_NATIVE_AVAILABLE:
+            raise ValueError("Playwright is not available. Please install playwright or use a different browser type.")
+        if value == "camoufox" and not CAMOUFOX_AVAILABLE:
+            raise ValueError("Camoufox is not available. Please install camoufox or use a different browser type.")
+        return value
+
+    async def _launch_browser_instance(self, browser_type: str):
+        normalized = self._normalize_browser_type(browser_type)
+        if normalized in ['chromium', 'chrome', 'msedge']:
+            runtime = await async_patchright().start()
+            launch_options = {
+                "headless": self.headless,
+                "args": self.browser_args,
+            }
+            if normalized != 'chromium':
+                launch_options["channel"] = normalized
+            browser = await runtime.chromium.launch(**launch_options)
+            return runtime, browser
+
+        if normalized == "playwright":
+            runtime = await async_playwright_native().start()
+            browser = await runtime.chromium.launch(
+                headless=self.headless,
+                args=self.browser_args,
+            )
+            return runtime, browser
+
+        camoufox = AsyncCamoufox(headless=self.headless)
+        browser = await camoufox.start()
+        return camoufox, browser
+
+    async def _acquire_browser(self, browser_type_override: Optional[str] = None):
+        requested_browser_type = self._normalize_browser_type(browser_type_override)
+        if requested_browser_type == self.browser_type:
+            index, browser = await self.browser_pool.get()
+
+            async def _release():
+                await self.browser_pool.put((index, browser))
+
+            return index, browser, requested_browser_type, _release
+
+        runtime, browser = await self._launch_browser_instance(requested_browser_type)
+        released = False
+
+        async def _release():
+            nonlocal released
+            if released:
+                return
+            released = True
+            try:
+                await browser.close()
+            except Exception:
+                pass
+            stop = getattr(runtime, "stop", None)
+            if callable(stop):
+                try:
+                    await stop()
+                except Exception:
+                    pass
+
+        if self.debug:
+            logger.info(
+                "Ephemeral browser launched | requested_browser=%s default_browser=%s",
+                requested_browser_type,
+                self.browser_type,
+            )
+        return 0, browser, requested_browser_type, _release
 
     def _browser_context_options(self, proxy: Optional[Dict[str, str]]) -> Dict[str, Any]:
         opts: Dict[str, Any] = {
@@ -868,28 +960,9 @@ class TurnstileAPIServer:
 
     async def _initialize_browser(self) -> None:
         """Initialize the browser and create the page pool."""
-
-        if self.browser_type in ['chromium', 'chrome', 'msedge']:
-            playwright = await async_playwright().start()
-        elif self.browser_type == "camoufox":
-            if not CAMOUFOX_AVAILABLE:
-                raise ValueError("Camoufox is not available. Please install camoufox or use a different browser type.")
-            camoufox = AsyncCamoufox(headless=self.headless)
-
         for _ in range(self.thread_count):
-            if self.browser_type in ['chromium', 'chrome', 'msedge']:
-                launch_options = {
-                    "headless": self.headless,
-                    "args": self.browser_args,
-                }
-                # No channel means the bundled installed Chromium. Chrome/Edge are real channels.
-                if self.browser_type != 'chromium':
-                    launch_options["channel"] = self.browser_type
-                browser = await playwright.chromium.launch(**launch_options)
-
-            elif self.browser_type == "camoufox":
-                browser = await camoufox.start()
-
+            runtime, browser = await self._launch_browser_instance(self.browser_type)
+            self.browser_runtimes.append(runtime)
             await self.browser_pool.put((_+1, browser))
 
             if self.debug:
@@ -905,18 +978,22 @@ class TurnstileAPIServer:
         action: Optional[str],
         cdata: Optional[str],
         solve_timeout: Optional[float],
+        browser_type_override: Optional[str] = None,
         proxy_cfg_override: Optional[Dict[str, str]] = None,
         reverse_proxy_base: Optional[str] = None,
         reverse_proxy_style: str = "host",
     ) -> None:
         """Serve local HTML with an embedded Turnstile widget (legacy flow when ``sitekey`` is provided)."""
-        index, browser = await self.browser_pool.get()
+        index, browser, effective_browser_type, release_browser = await self._acquire_browser(browser_type_override)
 
         try:
             proxy_cfg, proxy_label = self._pick_proxy_for_solve(proxy_cfg_override)
+            current_browser_type = self.browser_type
+            self.browser_type = effective_browser_type
             self._assert_proxy_supported_by_browser(proxy_cfg)
+            self.browser_type = current_browser_type
         except ValueError:
-            await self.browser_pool.put((index, browser))
+            await release_browser()
             raise
 
         rev_base = reverse_proxy_base.rstrip("/") if reverse_proxy_base else None
@@ -959,7 +1036,8 @@ class TurnstileAPIServer:
             await page.route("**/*", _all_embedded_routes)
             if self.debug:
                 logger.debug(
-                    f"Browser {index}: Embedded solve | url={url_with_slash!r} sitekey={sitekey!r} proxy={proxy_label!r}"
+                    f"Browser {index}: Embedded solve | url={url_with_slash!r} sitekey={sitekey!r} "
+                    f"proxy={proxy_label!r} browser={effective_browser_type!r}"
                 )
 
             await page.goto(url_with_slash, wait_until="domcontentloaded", timeout=120000)
@@ -981,7 +1059,12 @@ class TurnstileAPIServer:
                             f"{COLORS.get('MAGENTA')}{turnstile_check[:10]}…{COLORS.get('RESET')} in "
                             f"{COLORS.get('GREEN')}{elapsed_time}{COLORS.get('RESET')}s"
                         )
-                        self.results[task_id] = {"value": turnstile_check, "elapsed_time": elapsed_time}
+                        self.results[task_id] = {
+                            "value": turnstile_check,
+                            "elapsed_time": elapsed_time,
+                            "browser_type": effective_browser_type,
+                            "browser_backend": effective_browser_type,
+                        }
                         self._save_results()
                         return
                 except Exception:
@@ -997,6 +1080,8 @@ class TurnstileAPIServer:
                         "attempts": 10,
                         "url_initial": url_with_slash,
                         "sitekey": sitekey,
+                        "browser_type": effective_browser_type,
+                        "browser_backend": effective_browser_type,
                     },
                 )
                 self.results[task_id] = payload
@@ -1018,6 +1103,8 @@ class TurnstileAPIServer:
                     "message": f"Solve exceeded time limit of {solve_timeout} second(s).",
                     "sitekey": sitekey,
                     "url_initial": url,
+                    "browser_type": effective_browser_type,
+                    "browser_backend": effective_browser_type,
                 },
             )
             self.results[task_id] = payload
@@ -1032,6 +1119,8 @@ class TurnstileAPIServer:
                     "error": self._trim_text(e, 320),
                     "sitekey": sitekey,
                     "url_initial": url,
+                    "browser_type": effective_browser_type,
+                    "browser_backend": effective_browser_type,
                 },
             )
             self.results[task_id] = payload
@@ -1044,7 +1133,7 @@ class TurnstileAPIServer:
                     await context.close()
                 except Exception:
                     pass
-            await self.browser_pool.put((index, browser))
+            await release_browser()
 
     async def _solve_turnstile(
         self,
@@ -1054,6 +1143,7 @@ class TurnstileAPIServer:
         action: str = None,
         cdata: str = None,
         solve_timeout: Optional[float] = None,
+        browser_type_override: Optional[str] = None,
         proxy_cfg_override: Optional[Dict[str, str]] = None,
         reverse_proxy_base: Optional[str] = None,
         reverse_proxy_style: str = "host",
@@ -1067,19 +1157,23 @@ class TurnstileAPIServer:
                 action,
                 cdata,
                 solve_timeout,
+                browser_type_override,
                 proxy_cfg_override,
                 reverse_proxy_base,
                 reverse_proxy_style,
             )
             return
 
-        index, browser = await self.browser_pool.get()
+        index, browser, effective_browser_type, release_browser = await self._acquire_browser(browser_type_override)
 
         try:
             proxy_cfg, proxy_label = self._pick_proxy_for_solve(proxy_cfg_override)
+            current_browser_type = self.browser_type
+            self.browser_type = effective_browser_type
             self._assert_proxy_supported_by_browser(proxy_cfg)
+            self.browser_type = current_browser_type
         except ValueError:
-            await self.browser_pool.put((index, browser))
+            await release_browser()
             raise
 
         start_time = time.time()
@@ -1155,7 +1249,8 @@ class TurnstileAPIServer:
             try:
                 if self.debug:
                     logger.debug(
-                        f"Browser {index}: Real page solve | url={page_url} sitekey={sitekey!r} proxy={proxy_label!r}"
+                        f"Browser {index}: Real page solve | url={page_url} sitekey={sitekey!r} "
+                        f"proxy={proxy_label!r} browser={effective_browser_type!r}"
                     )
 
                 await page.goto(page_url, wait_until="domcontentloaded", timeout=120000)
@@ -1214,6 +1309,8 @@ class TurnstileAPIServer:
                         "value": "CAPTCHA_FAIL",
                         "elapsed_time": elapsed_time,
                         "url_final": page.url,
+                        "browser_type": effective_browser_type,
+                        "browser_backend": effective_browser_type,
                     }
                     try:
                         cookies = await context.cookies()
@@ -1325,6 +1422,8 @@ class TurnstileAPIServer:
                         "elapsed_time": elapsed_time,
                         "url_initial": page_url,
                         "url_final": page.url,
+                        "browser_type": effective_browser_type,
+                        "browser_backend": effective_browser_type,
                         "cookies": cookies,
                         "cookie_header": cookie_header,
                         "d_locl_cookie_header": self._d_locl_cookie_header(cookies),
@@ -1358,6 +1457,8 @@ class TurnstileAPIServer:
                         "document_failure_text": last_document_failure_text[0] if 'last_document_failure_text' in locals() else "",
                         "error": self._trim_text(e, 320),
                         "ip_preflight": ip_preflight if 'ip_preflight' in locals() else None,
+                        "browser_type": effective_browser_type,
+                        "browser_backend": effective_browser_type,
                     },
                 )
                 self.results[task_id] = payload
@@ -1379,6 +1480,8 @@ class TurnstileAPIServer:
                     "timeout_seconds": solve_timeout,
                     "message": f"Solve exceeded time limit of {solve_timeout} second(s).",
                     "url_initial": url,
+                    "browser_type": effective_browser_type,
+                    "browser_backend": effective_browser_type,
                 },
             )
             self.results[task_id] = payload
@@ -1393,7 +1496,7 @@ class TurnstileAPIServer:
                     await context.close()
                 except Exception:
                     pass
-            await self.browser_pool.put((index, browser))
+            await release_browser()
 
     async def process_turnstile(self):
         """Handle the /turnstile endpoint requests."""
@@ -1403,12 +1506,20 @@ class TurnstileAPIServer:
         action = request.args.get('action')
         cdata = request.args.get('cdata')
         timeout_raw = request.args.get('timeout')
+        browser_raw = request.args.get("browser") or request.args.get("browser_type")
         proxy_raw = request.args.get("proxy")
+        try:
+            requested_browser_type = self._normalize_browser_type(browser_raw)
+        except ValueError as e:
+            return jsonify({"status": "error", "error": str(e)}), 400
         proxy_cfg_override: Optional[Dict[str, str]] = None
         if proxy_raw is not None and str(proxy_raw).strip():
             try:
                 proxy_cfg_override = self._parse_proxy_spec(proxy_raw)
+                current_browser_type = self.browser_type
+                self.browser_type = requested_browser_type
                 self._assert_proxy_supported_by_browser(proxy_cfg_override)
+                self.browser_type = current_browser_type
             except ValueError as e:
                 return jsonify({"status": "error", "error": str(e)}), 400
 
@@ -1438,7 +1549,7 @@ class TurnstileAPIServer:
                 "error": "'url' is required"
             }), 400
 
-        solve_timeout = None
+        solve_timeout = self.DEFAULT_SOLVE_TIMEOUT_SECONDS
         if timeout_raw is not None and str(timeout_raw).strip() != "":
             try:
                 solve_timeout = float(timeout_raw)
@@ -1457,7 +1568,7 @@ class TurnstileAPIServer:
             task_id,
             self._trim_text(url, 180),
             "provided" if sitekey else "none",
-            self.browser_type,
+            requested_browser_type,
             self.headless,
             solve_timeout,
             proxy_cfg_override.get("server") if proxy_cfg_override else None,
@@ -1475,6 +1586,7 @@ class TurnstileAPIServer:
                 action,
                 cdata,
                 solve_timeout,
+                requested_browser_type,
                 proxy_cfg_override,
                 reverse_proxy_base,
                 reverse_proxy_style_effective,
@@ -1528,7 +1640,7 @@ def parse_args():
         action='store_true',
         help='Verbose solver logging (browser steps, waits, errors)',
     )
-    parser.add_argument('--browser_type', type=str, default='chromium', help='Specify the browser type for the solver. Supported options: chromium, chrome, msedge, camoufox (default: chromium)')
+    parser.add_argument('--browser_type', type=str, default='chromium', help='Specify the default browser type for the solver. Supported options: chromium, playwright, chrome, msedge, camoufox (default: chromium)')
     parser.add_argument('--thread', type=int, default=1, help='Set the number of browser threads to use for multi-threaded mode. Increasing this will speed up execution but requires more resources (default: 1)')
     parser.add_argument('--proxy', action='store_true', help='Pick a random proxy from proxies.txt for each solve')
     parser.add_argument('--host', type=str, default='127.0.0.1', help='Specify the IP address where the API solver runs. (Default: 127.0.0.1)')
@@ -1560,12 +1672,12 @@ def create_app(
 
 if __name__ == '__main__':
     args = parse_args()
-    browser_types = ['chromium', 'chrome', 'msedge']
-    if CAMOUFOX_AVAILABLE:
-        browser_types.append('camoufox')
+    browser_types = TurnstileAPIServer._supported_browser_types()
     
     if args.browser_type not in browser_types:
-        if args.browser_type == 'camoufox' and not CAMOUFOX_AVAILABLE:
+        if args.browser_type == 'playwright' and not PLAYWRIGHT_NATIVE_AVAILABLE:
+            logger.error(f"Playwright is not available. Please install playwright or use a different browser type. Available browser types: {browser_types}")
+        elif args.browser_type == 'camoufox' and not CAMOUFOX_AVAILABLE:
             logger.error(f"Camoufox is not available. Please install camoufox or use a different browser type. Available browser types: {browser_types}")
         else:
             logger.error(f"Unknown browser type: {COLORS.get('RED')}{args.browser_type}{COLORS.get('RESET')} Available browser types: {browser_types}")
