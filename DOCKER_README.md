@@ -36,7 +36,10 @@ docker-compose down && docker-compose build --no-cache && docker-compose up -d
 docker build -t turnstile-solver .
 
 # Run the container
-docker run -d -p 5000:5000 --name turnstile-solver turnstile-solver
+docker run -d --user 0:0 -p 5000:5000 -p 3389:3389 \
+  -e RUN_API_SOLVER=true \
+  -e ENABLE_RDP_WITH_API=true \
+  --name turnstile-solver turnstile-solver
 ```
 
 ## Access the API
@@ -64,11 +67,37 @@ The Docker setup includes:
 - **Memory Limit**: 4GB
 - **Shared Memory**: 2GB (for browser stability)
 - **Auto-restart**: Unless stopped manually
-- **Browser Support**: Chromium only (camoufox excluded due to large download size)
+- **Default Browser**: SeleniumBase (Chrome backend)
+- **Browser Override**: Set `SOLVER_BROWSER_TYPE` (for example `chromium` or `playwright`)
+- **Virtual GUI Geometry**: `1920x1080x24` with `96 DPI` (Xvfb)
+- **RDP with API mode**: enabled by default via `ENABLE_RDP_WITH_API=true` and `user: "0:0"` in `docker-compose.yml`
 
 ## Browser Support
 
-**Note**: The Docker version uses only Chromium browser due to camoufox's large binary download (700MB+) causing build timeouts. For full browser support including camoufox, use the native Python installation method described in the main README.md.
+**Note**: Docker now defaults to SeleniumBase (`SOLVER_BROWSER_TYPE=seleniumbase`). You can still switch to `chromium` or `playwright` by overriding `SOLVER_BROWSER_TYPE` in `docker-compose.yml` or container env vars.
+
+## Virtual GUI tuning (Turnstile visibility)
+
+You can tune virtual display and browser viewport via env vars:
+
+- `XVFB_SCREEN_WIDTH` (default `1920`)
+- `XVFB_SCREEN_HEIGHT` (default `1080`)
+- `XVFB_SCREEN_DEPTH` (default `24`)
+- `XVFB_DPI` (default `96`)
+- `SOLVER_VIEWPORT_WIDTH` (default follows `XVFB_SCREEN_WIDTH`)
+- `SOLVER_VIEWPORT_HEIGHT` (default follows `XVFB_SCREEN_HEIGHT`)
+- `SOLVER_DEVICE_SCALE_FACTOR` (default `1.0`)
+- `SELENIUMBASE_PREWARM` (default `true`)
+- `SELENIUMBASE_PREFETCH_DRIVER` (default `true`)
+- `SELENIUMBASE_UC` optional override (`true` / `false`; default `false` for Docker stability)
+
+Recommended baseline for Turnstile visibility:
+- `1920x1080`, depth `24`, `96 DPI`, `SOLVER_DEVICE_SCALE_FACTOR=1.0`
+
+To use RDP while API mode is running, keep:
+- `RUN_API_SOLVER=true`
+- `ENABLE_RDP_WITH_API=true`
+- Compose user as root: `user: "0:0"`
 
 ## Troubleshooting
 

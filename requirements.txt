@@ -4,3 +4,4 @@ argparse
 patchright
 playwright
 camoufox[geoip]
+seleniumbase

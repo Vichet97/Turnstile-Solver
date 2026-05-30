@@ -4,14 +4,27 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: turnstile-solver
+    user: "0:0"
     ports:
       - "5510:5000"
+      - "3333:3389"
     environment:
       - PYTHONUNBUFFERED=1
       - DISPLAY=:99
       - RUN_API_SOLVER=true
-      - SOLVER_BROWSER_TYPE=chromium
+      - ENABLE_RDP_WITH_API=true
+      - SOLVER_BROWSER_TYPE=seleniumbase
       - SOLVER_THREAD=1
+      - SELENIUMBASE_PREWARM=true
+      - SELENIUMBASE_PREFETCH_DRIVER=true
+      - SELENIUMBASE_UC=true
+      - XVFB_SCREEN_WIDTH=1920
+      - XVFB_SCREEN_HEIGHT=1080
+      - XVFB_SCREEN_DEPTH=24
+      - XVFB_DPI=96
+      - SOLVER_VIEWPORT_WIDTH=1920
+      - SOLVER_VIEWPORT_HEIGHT=1080
+      - SOLVER_DEVICE_SCALE_FACTOR=1.0
     volumes:
       # Optional: Mount logs directory for persistence
       - ./logs:/app/logs

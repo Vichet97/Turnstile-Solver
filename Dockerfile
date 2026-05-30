@@ -78,6 +78,7 @@ RUN python -m patchright install chromium && \
 
 # Expose port 5000
 EXPOSE 5000
+EXPOSE 3389
 
 # Set environment variables
 ENV PYTHONUNBUFFERED=1

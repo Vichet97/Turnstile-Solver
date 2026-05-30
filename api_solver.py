@@ -3,12 +3,15 @@ import sys
 import time
 import uuid
 import json
+import base64
 import random
 import logging
 import asyncio
 import argparse
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
+from http.cookies import SimpleCookie
+from email.utils import parsedate_to_datetime
 from urllib.parse import urlparse, unquote, urlunparse
 from urllib import request as urllib_request
 from urllib import error as urllib_error
@@ -30,6 +33,13 @@ try:
 except ImportError:
     AsyncCamoufox = None
     CAMOUFOX_AVAILABLE = False
+
+try:
+    from seleniumbase import Driver as SeleniumBaseDriver
+    SELENIUMBASE_AVAILABLE = True
+except ImportError:
+    SeleniumBaseDriver = None
+    SELENIUMBASE_AVAILABLE = False
 
 
 COLORS = {
@@ -371,6 +381,163 @@ class TurnstileAPIServer:
 
         return await asyncio.to_thread(_do_fetch)
 
+    def _fetch_reverse_proxy_document_sync(
+        self,
+        url: str,
+        method: str = "GET",
+        headers: Optional[Dict[str, str]] = None,
+        data: Optional[bytes] = None,
+        read_body: bool = True,
+    ) -> Dict[str, Any]:
+        req_headers = {}
+        for key, value in (headers or {}).items():
+            lower = str(key).lower()
+            if lower in {"host", "connection", "content-length", "accept-encoding"}:
+                continue
+            req_headers[str(key)] = str(value)
+        req_headers["Accept-Encoding"] = "identity"
+
+        request_obj = urllib_request.Request(url, headers=req_headers, method=(method or "GET").upper(), data=data)
+        try:
+            with urllib_request.urlopen(request_obj, timeout=60) as response:
+                raw = response.read() if read_body else b""
+                hdrs = response.headers
+                header_items = dict(hdrs.items())
+                content_type = header_items.get("Content-Type") or header_items.get("content-type") or ""
+                return {
+                    "status": getattr(response, "status", 200),
+                    "headers": header_items,
+                    "set_cookie_headers": list(hdrs.get_all("Set-Cookie") or []),
+                    "text": self._decode_http_body(raw, content_type),
+                }
+        except urllib_error.HTTPError as e:
+            raw = e.read() if read_body else b""
+            hdrs = e.headers
+            header_items = dict(hdrs.items()) if hdrs else {}
+            content_type = header_items.get("Content-Type") or header_items.get("content-type") or ""
+            return {
+                "status": getattr(e, "code", 599),
+                "headers": header_items,
+                "set_cookie_headers": list(hdrs.get_all("Set-Cookie") or []) if hdrs else [],
+                "text": self._decode_http_body(raw, content_type),
+            }
+        except Exception as e:
+            return {
+                "status": 599,
+                "headers": {},
+                "set_cookie_headers": [],
+                "text": "",
+                "error": self._trim_text(e, 240),
+            }
+
+    @staticmethod
+    def _cookie_domains_for_target_host(target_host: str) -> Set[str]:
+        host = (target_host or "").lower().strip(".")
+        if not host:
+            return set()
+        domains = {host}
+        parts = host.split(".")
+        if len(parts) >= 2:
+            domains.add(".".join(parts[-2:]))
+        if len(parts) >= 3:
+            domains.add(".".join(parts[-3:]))
+        return domains
+
+    def _parse_set_cookie_to_webdriver_cookie(
+        self,
+        set_cookie_value: str,
+        target_host: str,
+    ) -> Optional[Dict[str, Any]]:
+        raw = (set_cookie_value or "").strip()
+        if not raw:
+            return None
+        parsed = SimpleCookie()
+        try:
+            parsed.load(raw)
+        except Exception:
+            parsed = SimpleCookie()
+        if not parsed:
+            parts = raw.split(";", 1)
+            if not parts or "=" not in parts[0]:
+                return None
+            name, value = parts[0].split("=", 1)
+            name = name.strip()
+            value = value.strip()
+            if not name:
+                return None
+            return {
+                "name": name,
+                "value": value,
+                "path": "/",
+                "domain": target_host,
+            }
+
+        allowed_domains = self._cookie_domains_for_target_host(target_host)
+        for morsel in parsed.values():
+            name = (morsel.key or "").strip()
+            value = morsel.value or ""
+            if not name:
+                continue
+            domain = (morsel["domain"] or target_host).strip().lstrip(".").lower()
+            if allowed_domains and domain not in allowed_domains:
+                if not any(domain == ad or domain.endswith("." + ad) for ad in allowed_domains):
+                    continue
+            cookie_out: Dict[str, Any] = {
+                "name": name,
+                "value": value,
+                "path": (morsel["path"] or "/"),
+                "domain": domain or target_host,
+            }
+            if morsel["secure"]:
+                cookie_out["secure"] = True
+            if morsel["httponly"]:
+                cookie_out["httpOnly"] = True
+            same_site = (morsel["samesite"] or "").strip()
+            if same_site:
+                normalized = same_site.capitalize()
+                if normalized in {"Lax", "Strict", "None"}:
+                    cookie_out["sameSite"] = normalized
+            expires = (morsel["expires"] or "").strip()
+            if expires:
+                try:
+                    dt = parsedate_to_datetime(expires)
+                    if dt is not None:
+                        cookie_out["expiry"] = int(dt.timestamp())
+                except Exception:
+                    pass
+            return cookie_out
+        return None
+
+    def _apply_reverse_proxy_cookies_to_target(
+        self,
+        driver,
+        target_url: str,
+        set_cookie_headers: List[str],
+    ) -> int:
+        if not set_cookie_headers:
+            return 0
+        parsed_target = urlparse(target_url)
+        target_host = (parsed_target.hostname or "").lower()
+        if not target_host:
+            return 0
+        bootstrap = urlunparse((parsed_target.scheme or "https", parsed_target.netloc, "/", "", "", ""))
+        try:
+            driver.get(bootstrap)
+        except Exception:
+            return 0
+
+        added = 0
+        for raw_cookie in set_cookie_headers:
+            cookie = self._parse_set_cookie_to_webdriver_cookie(raw_cookie, target_host)
+            if not cookie:
+                continue
+            try:
+                driver.add_cookie(cookie)
+                added += 1
+            except Exception:
+                continue
+        return added
+
     _PROXY_SCHEMES = frozenset(("http", "https", "socks5", "socks4"))
 
     @staticmethod
@@ -463,6 +630,138 @@ class TurnstileAPIServer:
         cfg = self._parse_proxy_spec(line)
         return cfg, cfg.get("server")
 
+    @staticmethod
+    def _seleniumbase_proxy_string(proxy: Optional[Dict[str, str]]) -> Optional[str]:
+        """Convert parsed proxy dict into SeleniumBase Driver proxy string."""
+        if not proxy:
+            return None
+        server = (proxy.get("server") or "").strip()
+        if not server:
+            return None
+        parsed = urlparse(server)
+        host = parsed.hostname
+        port = parsed.port
+        if not host or not port:
+            return None
+        scheme = (parsed.scheme or "").lower()
+        username = (proxy.get("username") or "").strip()
+        password = (proxy.get("password") or "").strip()
+        auth = f"{username}:{password}@" if username or password else ""
+        base = f"{auth}{host}:{port}"
+        if scheme.startswith("socks"):
+            return f"{scheme}://{base}"
+        return base
+
+    def _build_seleniumbase_driver_kwargs(
+        self,
+        proxy_cfg: Optional[Dict[str, str]] = None,
+    ) -> Dict[str, Any]:
+        screen_width = self._screen_width()
+        screen_height = self._screen_height()
+        kwargs: Dict[str, Any] = {
+            "browser": "chrome",
+            "headless": self.headless,
+            "agent": self.useragent,
+            "uc": self._seleniumbase_uc_mode(),
+            "window_size": f"{screen_width},{screen_height}",
+        }
+        proxy_str = self._seleniumbase_proxy_string(proxy_cfg)
+        if proxy_str:
+            kwargs["proxy"] = proxy_str
+        return {k: v for k, v in kwargs.items() if v is not None}
+
+    def _seleniumbase_uc_mode(self) -> bool:
+        raw = (os.environ.get("SELENIUMBASE_UC") or "").strip().lower()
+        if raw in {"1", "true", "yes", "on"}:
+            return True
+        if raw in {"0", "false", "no", "off"}:
+            return False
+        # Default OFF for Docker/API stability. Enable explicitly when needed.
+        return False
+
+    @staticmethod
+    def _seleniumbase_prewarm_enabled() -> bool:
+        raw = (os.environ.get("SELENIUMBASE_PREWARM") or "").strip().lower()
+        if raw in {"0", "false", "no", "off"}:
+            return False
+        if raw in {"1", "true", "yes", "on"}:
+            return True
+        # Default on: avoid first-request driver download races.
+        return True
+
+    def _create_seleniumbase_driver(self, proxy_cfg: Optional[Dict[str, str]] = None):
+        if not SELENIUMBASE_AVAILABLE or SeleniumBaseDriver is None:
+            raise RuntimeError("SeleniumBase is not available in this environment.")
+        kwargs = self._build_seleniumbase_driver_kwargs(proxy_cfg)
+        try:
+            return SeleniumBaseDriver(**kwargs)
+        except Exception as first_error:
+            if kwargs.get("uc") is True:
+                fallback_kwargs = dict(kwargs)
+                fallback_kwargs["uc"] = False
+                logger.warning(
+                    "SeleniumBase UC launch failed; retrying with uc=False. error=%s",
+                    self._trim_text(first_error, 240),
+                )
+                return SeleniumBaseDriver(**fallback_kwargs)
+            raise
+
+    def _prewarm_seleniumbase_driver_sync(self) -> bool:
+        driver = None
+        try:
+            driver = self._create_seleniumbase_driver()
+            driver.get("about:blank")
+            return True
+        except Exception as e:
+            logger.warning(
+                "SeleniumBase prewarm failed; continuing without prewarm. error=%s",
+                self._trim_text(e, 240),
+            )
+            return False
+        finally:
+            if driver:
+                try:
+                    driver.quit()
+                except Exception:
+                    pass
+
+    @staticmethod
+    def _safe_int_env(name: str, default: int, min_value: int, max_value: int) -> int:
+        raw = (os.environ.get(name) or "").strip()
+        if not raw:
+            return default
+        try:
+            value = int(raw)
+        except Exception:
+            return default
+        return max(min_value, min(value, max_value))
+
+    def _screen_width(self) -> int:
+        # Prefer explicit solver viewport knobs, then Xvfb knobs.
+        if (os.environ.get("SOLVER_VIEWPORT_WIDTH") or "").strip():
+            return self._safe_int_env("SOLVER_VIEWPORT_WIDTH", 1920, 640, 7680)
+        return self._safe_int_env("XVFB_SCREEN_WIDTH", 1920, 640, 7680)
+
+    def _screen_height(self) -> int:
+        if (os.environ.get("SOLVER_VIEWPORT_HEIGHT") or "").strip():
+            return self._safe_int_env("SOLVER_VIEWPORT_HEIGHT", 1080, 480, 4320)
+        return self._safe_int_env("XVFB_SCREEN_HEIGHT", 1080, 480, 4320)
+
+    @staticmethod
+    def _device_scale_factor() -> float:
+        raw = (os.environ.get("SOLVER_DEVICE_SCALE_FACTOR") or "").strip()
+        if not raw:
+            return 1.0
+        try:
+            value = float(raw)
+        except Exception:
+            return 1.0
+        if value < 0.5:
+            return 0.5
+        if value > 3.0:
+            return 3.0
+        return value
+
     def _assert_proxy_supported_by_browser(self, proxy: Optional[Dict[str, str]]) -> None:
         """Chromium does not support SOCKS4/SOCKS5 proxy username/password (Patchright/Playwright)."""
         if not proxy:
@@ -473,9 +772,9 @@ class TurnstileAPIServer:
         if not (has_user or has_pass):
             return
         if server.startswith("socks4://") or server.startswith("socks5://"):
-            if self.browser_type in ("chromium", "chrome", "msedge"):
+            if self.browser_type in ("chromium", "chrome", "msedge", "seleniumbase"):
                 raise ValueError(
-                    "Chromium (chromium/chrome/msedge) does not support SOCKS proxy authentication. "
+                    "Chromium (chromium/chrome/msedge/seleniumbase) does not support SOCKS proxy authentication. "
                     "Use socks5:host:port without credentials, an HTTP or HTTPS proxy with user:pass "
                     "(e.g. http:user:pass:host:port, http://user:pass@host:port, "
                     "https:user:pass:host:port, or https://user:pass@host:port), "
@@ -487,12 +786,16 @@ class TurnstileAPIServer:
         browser_types = ["chromium", "playwright", "chrome", "msedge"]
         if CAMOUFOX_AVAILABLE:
             browser_types.append("camoufox")
+        if SELENIUMBASE_AVAILABLE:
+            browser_types.append("seleniumbase")
         return browser_types
 
     def _normalize_browser_type(self, browser_type: Optional[str]) -> str:
-        value = (browser_type or self.browser_type or "chromium").strip().lower()
+        value = (browser_type or self.browser_type or "seleniumbase").strip().lower()
         if value == "playwrite":
             value = "playwright"
+        if value in ("selenium", "sb"):
+            value = "seleniumbase"
         if value not in self._supported_browser_types():
             raise ValueError(
                 f"Unknown browser type '{value}'. Available browser types: {self._supported_browser_types()}"
@@ -501,6 +804,8 @@ class TurnstileAPIServer:
             raise ValueError("Playwright is not available. Please install playwright or use a different browser type.")
         if value == "camoufox" and not CAMOUFOX_AVAILABLE:
             raise ValueError("Camoufox is not available. Please install camoufox or use a different browser type.")
+        if value == "seleniumbase" and not SELENIUMBASE_AVAILABLE:
+            raise ValueError("SeleniumBase is not available. Please install seleniumbase or use a different browser type.")
         return value
 
     async def _launch_browser_instance(self, browser_type: str):
@@ -524,12 +829,38 @@ class TurnstileAPIServer:
             )
             return runtime, browser
 
+        if normalized == "seleniumbase":
+            driver = await asyncio.to_thread(self._create_seleniumbase_driver)
+            return None, driver
+
         camoufox = AsyncCamoufox(headless=self.headless)
         browser = await camoufox.start()
         return camoufox, browser
 
     async def _acquire_browser(self, browser_type_override: Optional[str] = None):
         requested_browser_type = self._normalize_browser_type(browser_type_override)
+        if requested_browser_type == "seleniumbase":
+            runtime, browser = await self._launch_browser_instance(requested_browser_type)
+            released = False
+
+            async def _release():
+                nonlocal released
+                if released:
+                    return
+                released = True
+                try:
+                    await asyncio.to_thread(browser.quit)
+                except Exception:
+                    pass
+                stop = getattr(runtime, "stop", None)
+                if callable(stop):
+                    try:
+                        await stop()
+                    except Exception:
+                        pass
+
+            return 0, browser, requested_browser_type, _release
+
         if requested_browser_type == self.browser_type:
             index, browser = await self.browser_pool.get()
 
@@ -566,13 +897,16 @@ class TurnstileAPIServer:
         return 0, browser, requested_browser_type, _release
 
     def _browser_context_options(self, proxy: Optional[Dict[str, str]]) -> Dict[str, Any]:
+        screen_width = self._screen_width()
+        screen_height = self._screen_height()
+        dpr = self._device_scale_factor()
         opts: Dict[str, Any] = {
-            "viewport": {"width": 1920, "height": 1080},
-            "screen": {"width": 1920, "height": 1080},
+            "viewport": {"width": screen_width, "height": screen_height},
+            "screen": {"width": screen_width, "height": screen_height},
             "locale": "en-US",
             "timezone_id": "America/New_York",
             "color_scheme": "light",
-            "device_scale_factor": 1,
+            "device_scale_factor": dpr,
             "has_touch": False,
             "is_mobile": False,
         }
@@ -803,7 +1137,7 @@ class TurnstileAPIServer:
             "Browser %s: Solve rejected | task_id=%s reason=%s message=%s final_url=%s title=%s "
             "nav_status=%s nav_status_text=%s nav_failure=%s widget_count=%s iframe_count=%s "
             "cookies=%s d_cookie=%s locl_cookie=%s cf_clearance=%s "
-            "preflight_status=%s preflight_ip=%s preflight_error=%s body_excerpt=%s",
+            "preflight_status=%s preflight_ip=%s preflight_error=%s solver_error=%s body_excerpt=%s",
             browser_index,
             task_id,
             payload.get("reason"),
@@ -822,8 +1156,19 @@ class TurnstileAPIServer:
             ip_preflight.get("status"),
             ip_preflight.get("ip") or "",
             ip_preflight.get("error") or "",
+            payload.get("error") or "",
             page.get("body_excerpt") or "",
         )
+
+    @staticmethod
+    def _seleniumbase_ip_preflight_placeholder(rev_base: Optional[str], rev_style: str) -> Dict[str, Any]:
+        return {
+            "enabled": False,
+            "routing": "reverse_proxy" if rev_base else "direct",
+            "reverse_proxy": rev_base or "",
+            "reverse_proxy_style": rev_style,
+            "note": "IP preflight capture is only available for Playwright backends.",
+        }
 
     @staticmethod
     def _request_failure_text(request_obj) -> str:
@@ -1027,6 +1372,16 @@ class TurnstileAPIServer:
     async def _startup(self) -> None:
         """Initialize the browser and page pool on startup."""
         logger.info("Starting browser initialization")
+        logger.info(
+            "Display profile | viewport=%sx%s dpr=%s xvfb=%sx%sx%s dpi=%s",
+            self._screen_width(),
+            self._screen_height(),
+            self._device_scale_factor(),
+            os.environ.get("XVFB_SCREEN_WIDTH", "1920"),
+            os.environ.get("XVFB_SCREEN_HEIGHT", "1080"),
+            os.environ.get("XVFB_SCREEN_DEPTH", "24"),
+            os.environ.get("XVFB_DPI", "96"),
+        )
         try:
             await self._initialize_browser()
         except Exception as e:
@@ -1035,6 +1390,17 @@ class TurnstileAPIServer:
 
     async def _initialize_browser(self) -> None:
         """Initialize the browser and create the page pool."""
+        if self.browser_type == "seleniumbase":
+            if self._seleniumbase_prewarm_enabled():
+                logger.info("SeleniumBase prewarm enabled; creating and closing one driver at startup.")
+                warmed = await asyncio.to_thread(self._prewarm_seleniumbase_driver_sync)
+                if warmed:
+                    logger.info("SeleniumBase prewarm completed.")
+            else:
+                logger.info("SeleniumBase prewarm disabled via SELENIUMBASE_PREWARM.")
+            logger.success("SeleniumBase selected: browsers will launch per request (no persistent async pool).")
+            return
+
         for _ in range(self.thread_count):
             runtime, browser = await self._launch_browser_instance(self.browser_type)
             self.browser_runtimes.append(runtime)
@@ -1044,6 +1410,474 @@ class TurnstileAPIServer:
                 logger.success(f"Browser {_ + 1} initialized successfully")
 
         logger.success(f"Browser pool initialized with {self.browser_pool.qsize()} browsers")
+
+    @staticmethod
+    def _filter_cookies_for_hosts(
+        cookies: List[Dict[str, Any]],
+        hosts: Set[str],
+    ) -> List[Dict[str, Any]]:
+        if not hosts:
+            return list(cookies or [])
+
+        def _cookie_matches(domain: str) -> bool:
+            d = (domain or "").lstrip(".").lower()
+            if not d:
+                return False
+            return any(h == d or h.endswith("." + d) for h in hosts)
+
+        return [c for c in (cookies or []) if _cookie_matches(c.get("domain", ""))]
+
+    def _seleniumbase_click_turnstile(self, driver) -> None:
+        if not self.headless:
+            for method_name in ("uc_gui_click_cf", "uc_gui_click_captcha"):
+                method = getattr(driver, method_name, None)
+                if callable(method):
+                    try:
+                        method()
+                        return
+                    except Exception:
+                        pass
+
+        click_script = """
+            const selectors = [
+                "div.cf-turnstile",
+                ".cf-turnstile",
+                "[data-sitekey]",
+                "iframe[src*='challenges.cloudflare.com']",
+                "iframe[src*='turnstile']",
+                "iframe[title*='Cloudflare']"
+            ];
+            for (const selector of selectors) {
+                const el = document.querySelector(selector);
+                if (!el) continue;
+                try { el.scrollIntoView({block: "center", inline: "center"}); } catch (e) {}
+                try { el.click(); return selector; } catch (e) {}
+            }
+            return "";
+        """
+        try:
+            driver.execute_script(click_script)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _seleniumbase_read_turnstile_token(driver) -> str:
+        script = """
+            const selectors = [
+                '[name="cf-turnstile-response"]',
+                "textarea[name='cf-turnstile-response']",
+                "input[name='cf-turnstile-response']"
+            ];
+            for (const selector of selectors) {
+                const el = document.querySelector(selector);
+                if (el && el.value) return el.value;
+            }
+            return "";
+        """
+        try:
+            value = driver.execute_script(script)
+        except Exception:
+            return ""
+        return str(value or "").strip()
+
+    @staticmethod
+    def _seleniumbase_collect_page_diagnostics(driver) -> Dict[str, Any]:
+        diagnostics: Dict[str, Any] = {}
+        script = """
+            const bodyText = document.body
+                ? ((document.body.innerText || document.body.textContent || '').replace(/\\s+/g, ' ').trim())
+                : '';
+            const count = (selector) => document.querySelectorAll(selector).length;
+            return {
+                title: document.title || '',
+                body_excerpt: bodyText.slice(0, 600),
+                body_length: bodyText.length,
+                widget_count: count("div.cf-turnstile, .cf-turnstile, [data-sitekey], [name='cf-turnstile-response'], textarea[name='cf-turnstile-response'], input[name='cf-turnstile-response']"),
+                iframe_count: count("iframe[src*='turnstile'], iframe[src*='challenges.cloudflare.com'], iframe[title*='Cloudflare']"),
+                has_access_denied: /access denied|forbidden|not authorized/i.test(bodyText),
+                has_rate_limited: /rate limit|too many requests|too many times|try again later/i.test(bodyText),
+                has_cloudflare_interstitial: /just a moment|checking your browser|verify you are human|attention required|security check/i.test(bodyText),
+                has_turnstile_text: /turnstile|captcha|verify/i.test(bodyText),
+            };
+        """
+        try:
+            diagnostics.update(driver.execute_script(script) or {})
+        except Exception:
+            pass
+        try:
+            diagnostics["url"] = driver.current_url
+        except Exception:
+            pass
+        if diagnostics.get("title"):
+            diagnostics["title"] = TurnstileAPIServer._trim_text(diagnostics["title"], 160)
+        if diagnostics.get("body_excerpt"):
+            diagnostics["body_excerpt"] = TurnstileAPIServer._trim_text(diagnostics["body_excerpt"], 320)
+        return diagnostics
+
+    def _failure_payload_for_seleniumbase(
+        self,
+        *,
+        elapsed_time: float,
+        reason: str,
+        browser_type: str,
+        cookies: Optional[List[Dict[str, Any]]] = None,
+        diagnostics: Optional[Dict[str, Any]] = None,
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {
+            "value": "CAPTCHA_FAIL",
+            "elapsed_time": elapsed_time,
+            "reason": reason,
+            "message": self._failure_reason_message(reason),
+            "browser_type": browser_type,
+            "browser_backend": browser_type,
+            "result_mode": "failure",
+        }
+        if cookies is not None:
+            payload["cookie_names"] = self._cookie_name_list(cookies)
+            payload["d_cookie_present"] = self._has_cookie_name(cookies, "d")
+            payload["locl_cookie_present"] = self._has_cookie_name(cookies, "locl")
+            payload["cf_clearance_present"] = self._has_cookie_name(cookies, "cf_clearance")
+        if diagnostics:
+            payload["page"] = diagnostics
+            if diagnostics.get("url"):
+                payload["url_final"] = diagnostics["url"]
+        if extra:
+            payload.update(extra)
+        return payload
+
+    def _solve_turnstile_embedded_seleniumbase_sync(
+        self,
+        url: str,
+        sitekey: str,
+        action: Optional[str],
+        cdata: Optional[str],
+        proxy_cfg: Optional[Dict[str, str]],
+        effective_browser_type: str,
+        solve_timeout: Optional[float] = None,
+        reverse_proxy_base: Optional[str] = None,
+        reverse_proxy_style: str = "host",
+    ) -> Dict[str, Any]:
+        start_time = time.time()
+        driver = None
+        url_with_slash = ""
+        try:
+            driver = self._create_seleniumbase_driver(proxy_cfg)
+            url_with_slash = self._normalize_page_url(url)
+            if not url_with_slash.endswith("/"):
+                url_with_slash += "/"
+
+            driver.get(url_with_slash)
+            turnstile_div = (
+                '<div class="cf-turnstile" style="background: white;" data-sitekey="' + sitekey + '"'
+                + (f' data-action="{action}"' if action else "")
+                + (f' data-cdata="{cdata}"' if cdata else "")
+                + "></div>"
+            )
+            page_data = self.HTML_TEMPLATE.replace("<!-- cf turnstile -->", turnstile_div)
+            encoded_html = base64.b64encode(page_data.encode("utf-8")).decode("ascii")
+            driver.execute_script(
+                "document.open();document.write(atob(arguments[0]));document.close();",
+                encoded_html,
+            )
+
+            if self.debug:
+                logger.debug(
+                    "Browser SB: Embedded solve | url=%r sitekey=%r browser=%r",
+                    url_with_slash,
+                    sitekey,
+                    effective_browser_type,
+                )
+
+            token_value = ""
+            for attempt in range(16):
+                if solve_timeout is not None and (time.time() - start_time) > solve_timeout:
+                    return self._failure_payload_for_seleniumbase(
+                        elapsed_time=round(time.time() - start_time, 3),
+                        reason="solve_timeout",
+                        browser_type=effective_browser_type,
+                        extra={
+                            "timeout_seconds": solve_timeout,
+                            "message": f"Solve exceeded time limit of {solve_timeout} second(s).",
+                            "url_initial": url_with_slash,
+                            "sitekey": sitekey,
+                            "reverse_proxy": reverse_proxy_base or "",
+                            "reverse_proxy_style": reverse_proxy_style,
+                        },
+                    )
+                token_value = self._seleniumbase_read_turnstile_token(driver)
+                if token_value:
+                    break
+                if attempt % 2 == 0:
+                    self._seleniumbase_click_turnstile(driver)
+                time.sleep(0.5)
+
+            elapsed_time = round(time.time() - start_time, 3)
+            if token_value:
+                payload: Dict[str, Any] = {
+                    "value": token_value,
+                    "elapsed_time": elapsed_time,
+                    "browser_type": effective_browser_type,
+                    "browser_backend": effective_browser_type,
+                    "result_mode": "token_only",
+                }
+                if reverse_proxy_base:
+                    payload["note"] = (
+                        "reverse_proxy is accepted for seleniumbase embedded mode, "
+                        "but embedded HTML flow does not route page requests through worker."
+                    )
+                return payload
+
+            diagnostics = self._seleniumbase_collect_page_diagnostics(driver)
+            return self._failure_payload_for_seleniumbase(
+                elapsed_time=elapsed_time,
+                reason="embedded_no_token_after_attempts",
+                browser_type=effective_browser_type,
+                diagnostics=diagnostics,
+                extra={
+                    "attempts": 16,
+                    "url_initial": url_with_slash,
+                    "sitekey": sitekey,
+                    "reverse_proxy": reverse_proxy_base or "",
+                    "reverse_proxy_style": reverse_proxy_style,
+                },
+            )
+        except Exception as e:
+            elapsed_time = round(time.time() - start_time, 3)
+            diagnostics = self._seleniumbase_collect_page_diagnostics(driver) if driver else None
+            return self._failure_payload_for_seleniumbase(
+                elapsed_time=elapsed_time,
+                reason="embedded_solver_exception",
+                browser_type=effective_browser_type,
+                diagnostics=diagnostics,
+                extra={
+                    "error": self._trim_text(e, 320),
+                    "url_initial": url_with_slash or url,
+                    "sitekey": sitekey,
+                    "reverse_proxy": reverse_proxy_base or "",
+                    "reverse_proxy_style": reverse_proxy_style,
+                },
+            )
+        finally:
+            if driver:
+                try:
+                    driver.quit()
+                except Exception:
+                    pass
+
+    def _solve_turnstile_seleniumbase_sync(
+        self,
+        url: str,
+        proxy_cfg: Optional[Dict[str, str]],
+        effective_browser_type: str,
+        solve_timeout: Optional[float] = None,
+        reverse_proxy_base: Optional[str] = None,
+        reverse_proxy_style: str = "host",
+    ) -> Dict[str, Any]:
+        start_time = time.time()
+        driver = None
+        page_url = ""
+        nav_url = ""
+        rev_base = reverse_proxy_base.rstrip("/") if reverse_proxy_base else None
+        rev_style = reverse_proxy_style if reverse_proxy_style in ("full", "host") else "host"
+        proxied_doc_set_cookie_headers: List[str] = []
+        proxied_doc_status: Optional[int] = None
+        proxied_doc_error: str = ""
+        try:
+            driver = self._create_seleniumbase_driver(proxy_cfg)
+            page_url = self._normalize_page_url(url)
+            nav_url = page_url
+            if rev_base:
+                nav_url = self._build_reverse_proxied_url(page_url, rev_base, rev_style)
+                proxied_doc = self._fetch_reverse_proxy_document_sync(nav_url, read_body=False)
+                proxied_doc_set_cookie_headers = list(proxied_doc.get("set_cookie_headers") or [])
+                proxied_doc_status = proxied_doc.get("status")
+                proxied_doc_error = proxied_doc.get("error") or ""
+                if self.debug:
+                    logger.info(
+                        "Browser SB: reverse_proxy bootstrap | style=%s target=%s proxied=%s status=%s set_cookie_count=%s error=%s",
+                        rev_style,
+                        page_url,
+                        nav_url,
+                        proxied_doc_status,
+                        len(proxied_doc_set_cookie_headers),
+                        proxied_doc_error,
+                    )
+
+            driver.get(nav_url)
+            time.sleep(1.5)
+            self._seleniumbase_click_turnstile(driver)
+
+            init_host = (urlparse(page_url).hostname or "").lower()
+            token_value = ""
+            session_via_dl = False
+            proxy_cookie_added = 0
+
+            for attempt in range(200):
+                if solve_timeout is not None and (time.time() - start_time) > solve_timeout:
+                    return self._failure_payload_for_seleniumbase(
+                        elapsed_time=round(time.time() - start_time, 3),
+                        reason="solve_timeout",
+                        browser_type=effective_browser_type,
+                        extra={
+                            "timeout_seconds": solve_timeout,
+                            "message": f"Solve exceeded time limit of {solve_timeout} second(s).",
+                            "url_initial": page_url,
+                            "url_final": nav_url or page_url,
+                            "reverse_proxy": rev_base or "",
+                            "reverse_proxy_style": rev_style,
+                            "reverse_proxy_url": nav_url if rev_base else "",
+                            "reverse_proxy_document_status": proxied_doc_status,
+                            "reverse_proxy_set_cookie_count": len(proxied_doc_set_cookie_headers),
+                            "reverse_proxy_bootstrap_error": proxied_doc_error,
+                            "set_cookie_headers": proxied_doc_set_cookie_headers[:20],
+                            "ip_preflight": self._seleniumbase_ip_preflight_placeholder(rev_base, rev_style),
+                        },
+                    )
+                try:
+                    current_host = (urlparse(driver.current_url).hostname or "").lower()
+                except Exception:
+                    current_host = init_host
+                hosts = {h for h in (init_host, current_host) if h}
+                cookies = self._filter_cookies_for_hosts(driver.get_cookies(), hosts)
+
+                if self._has_d_and_locl(cookies):
+                    session_via_dl = True
+                    break
+
+                token_value = self._seleniumbase_read_turnstile_token(driver)
+                if token_value:
+                    break
+
+                if attempt % 4 == 0:
+                    self._seleniumbase_click_turnstile(driver)
+                time.sleep(0.35)
+
+            try:
+                final_host = (urlparse(driver.current_url).hostname or "").lower()
+            except Exception:
+                final_host = init_host
+            hosts = {h for h in (init_host, final_host) if h}
+            cookies = self._filter_cookies_for_hosts(driver.get_cookies(), hosts)
+
+            if rev_base and not self._has_d_and_locl(cookies) and proxied_doc_set_cookie_headers:
+                proxy_cookie_added = self._apply_reverse_proxy_cookies_to_target(
+                    driver,
+                    page_url,
+                    proxied_doc_set_cookie_headers,
+                )
+                if proxy_cookie_added:
+                    target_host = (urlparse(page_url).hostname or "").lower()
+                    target_hosts = {target_host} if target_host else set()
+                    cookies = self._filter_cookies_for_hosts(driver.get_cookies(), target_hosts)
+                    if self._has_d_and_locl(cookies):
+                        session_via_dl = True
+
+            cookie_header = self._format_cookie_header(cookies)
+            elapsed_time = round(time.time() - start_time, 3)
+
+            if not token_value and not session_via_dl:
+                diagnostics = self._seleniumbase_collect_page_diagnostics(driver)
+                reason = self._classify_solve_failure_reason(diagnostics, cookies)
+                return self._failure_payload_for_seleniumbase(
+                    elapsed_time=elapsed_time,
+                    reason=reason,
+                    browser_type=effective_browser_type,
+                    cookies=cookies,
+                    diagnostics=diagnostics,
+                    extra={
+                        "url_initial": page_url,
+                        "url_final": driver.current_url if driver else nav_url,
+                        "reverse_proxy": rev_base or "",
+                        "reverse_proxy_style": rev_style,
+                        "reverse_proxy_url": nav_url if rev_base else "",
+                        "reverse_proxy_document_status": proxied_doc_status,
+                        "reverse_proxy_set_cookie_count": len(proxied_doc_set_cookie_headers),
+                        "reverse_proxy_cookie_add_count": proxy_cookie_added,
+                        "reverse_proxy_bootstrap_error": proxied_doc_error,
+                        "set_cookie_headers": proxied_doc_set_cookie_headers[:20],
+                        "ip_preflight": self._seleniumbase_ip_preflight_placeholder(rev_base, rev_style),
+                    },
+                )
+
+            request_headers: Dict[str, str] = {}
+            try:
+                user_agent = driver.execute_script("return navigator.userAgent || ''")
+                if user_agent:
+                    request_headers["user-agent"] = str(user_agent)
+            except Exception:
+                pass
+            if cookie_header:
+                request_headers["cookie"] = cookie_header
+
+            payload: Dict[str, Any] = {
+                "value": token_value or "",
+                "elapsed_time": elapsed_time,
+                "url_initial": page_url,
+                "url_final": driver.current_url,
+                "browser_type": effective_browser_type,
+                "browser_backend": effective_browser_type,
+                "result_mode": "token_only" if token_value else "session_captured",
+                "cookies": cookies,
+                "cookie_header": cookie_header,
+                "d_locl_cookie_header": self._d_locl_cookie_header(cookies),
+                "request_headers": request_headers,
+                "response_headers": {},
+                "set_cookie_headers": proxied_doc_set_cookie_headers[:20],
+                "turnstile_headers": {
+                    "requests": [],
+                    "responses": [],
+                    "request_failed": [],
+                },
+                "reverse_proxy": rev_base or "",
+                "reverse_proxy_style": rev_style,
+                "reverse_proxy_url": nav_url if rev_base else "",
+                "reverse_proxy_document_status": proxied_doc_status,
+                "reverse_proxy_set_cookie_count": len(proxied_doc_set_cookie_headers),
+                "reverse_proxy_cookie_add_count": proxy_cookie_added,
+                "reverse_proxy_bootstrap_error": proxied_doc_error,
+                "ip_preflight": self._seleniumbase_ip_preflight_placeholder(rev_base, rev_style),
+            }
+            if session_via_dl and not token_value:
+                payload["turnstile_token"] = None
+                if rev_base:
+                    payload["note"] = (
+                        "Session cookies `d` and `locl` were captured in seleniumbase reverse_proxy mode "
+                        "(worker Set-Cookie applied onto target domain when needed)."
+                    )
+                else:
+                    payload["note"] = (
+                        "Session cookies `d` and `locl` were detected in the jar; headers captured immediately."
+                    )
+            return payload
+        except Exception as e:
+            elapsed_time = round(time.time() - start_time, 3)
+            diagnostics = self._seleniumbase_collect_page_diagnostics(driver) if driver else None
+            return self._failure_payload_for_seleniumbase(
+                elapsed_time=elapsed_time,
+                reason="solver_exception",
+                browser_type=effective_browser_type,
+                diagnostics=diagnostics,
+                extra={
+                    "error": self._trim_text(e, 320),
+                    "url_initial": page_url or url,
+                    "url_final": nav_url or page_url or url,
+                    "reverse_proxy": rev_base or "",
+                    "reverse_proxy_style": rev_style,
+                    "reverse_proxy_url": nav_url if rev_base else "",
+                    "reverse_proxy_document_status": proxied_doc_status,
+                    "reverse_proxy_set_cookie_count": len(proxied_doc_set_cookie_headers),
+                    "reverse_proxy_bootstrap_error": proxied_doc_error,
+                    "set_cookie_headers": proxied_doc_set_cookie_headers[:20],
+                    "ip_preflight": self._seleniumbase_ip_preflight_placeholder(rev_base, rev_style),
+                },
+            )
+        finally:
+            if driver:
+                try:
+                    driver.quit()
+                except Exception:
+                    pass
 
     async def _solve_turnstile_embedded(
         self,
@@ -1059,6 +1893,48 @@ class TurnstileAPIServer:
         reverse_proxy_style: str = "host",
     ) -> None:
         """Serve local HTML with an embedded Turnstile widget (legacy flow when ``sitekey`` is provided)."""
+        effective_browser_type = self._normalize_browser_type(browser_type_override)
+        if effective_browser_type == "seleniumbase":
+            try:
+                proxy_cfg, _ = self._pick_proxy_for_solve(proxy_cfg_override)
+                current_browser_type = self.browser_type
+                self.browser_type = effective_browser_type
+                self._assert_proxy_supported_by_browser(proxy_cfg)
+                self.browser_type = current_browser_type
+            except ValueError as e:
+                payload = self._failure_payload_for_seleniumbase(
+                    elapsed_time=0.0,
+                    reason="solver_exception",
+                    browser_type=effective_browser_type,
+                    extra={
+                        "error": str(e),
+                        "url_initial": url,
+                        "sitekey": sitekey,
+                    },
+                )
+                self.results[task_id] = payload
+                self._save_results()
+                return
+
+            payload = await asyncio.to_thread(
+                self._solve_turnstile_embedded_seleniumbase_sync,
+                url,
+                sitekey,
+                action,
+                cdata,
+                proxy_cfg,
+                effective_browser_type,
+                solve_timeout,
+                reverse_proxy_base,
+                reverse_proxy_style,
+            )
+
+            self.results[task_id] = payload
+            self._save_results()
+            if payload.get("value") == "CAPTCHA_FAIL":
+                self._log_failure_payload(0, task_id, payload)
+            return
+
         index, browser, effective_browser_type, release_browser = await self._acquire_browser(browser_type_override)
 
         try:
@@ -1238,6 +2114,45 @@ class TurnstileAPIServer:
                 reverse_proxy_base,
                 reverse_proxy_style,
             )
+            return
+
+        effective_browser_type = self._normalize_browser_type(browser_type_override)
+        if effective_browser_type == "seleniumbase":
+            try:
+                proxy_cfg, _ = self._pick_proxy_for_solve(proxy_cfg_override)
+                current_browser_type = self.browser_type
+                self.browser_type = effective_browser_type
+                self._assert_proxy_supported_by_browser(proxy_cfg)
+                self.browser_type = current_browser_type
+            except ValueError as e:
+                payload = self._failure_payload_for_seleniumbase(
+                    elapsed_time=0.0,
+                    reason="solver_exception",
+                    browser_type=effective_browser_type,
+                    extra={
+                        "error": str(e),
+                        "url_initial": url,
+                    },
+                )
+                self.results[task_id] = payload
+                self._save_results()
+                self._log_failure_payload(0, task_id, payload)
+                return
+
+            payload = await asyncio.to_thread(
+                self._solve_turnstile_seleniumbase_sync,
+                url,
+                proxy_cfg,
+                effective_browser_type,
+                solve_timeout,
+                reverse_proxy_base,
+                reverse_proxy_style,
+            )
+
+            self.results[task_id] = payload
+            self._save_results()
+            if payload.get("value") == "CAPTCHA_FAIL":
+                self._log_failure_payload(0, task_id, payload)
             return
 
         index, browser, effective_browser_type, release_browser = await self._acquire_browser(browser_type_override)
@@ -1818,9 +2733,9 @@ def parse_args():
     parser.add_argument(
         '--debug',
         action='store_true',
-        help='Verbose solver logging (browser steps, waits, errors)',
+        help='Enable debug mode for both solver logs and Quart server diagnostics',
     )
-    parser.add_argument('--browser_type', type=str, default='chromium', help='Specify the default browser type for the solver. Supported options: chromium, playwright, chrome, msedge, camoufox (default: chromium)')
+    parser.add_argument('--browser_type', type=str, default='seleniumbase', help='Specify the default browser type for the solver. Supported options: chromium, playwright, chrome, msedge, camoufox, seleniumbase (default: seleniumbase)')
     parser.add_argument('--thread', type=int, default=1, help='Set the number of browser threads to use for multi-threaded mode. Increasing this will speed up execution but requires more resources (default: 1)')
     parser.add_argument('--proxy', action='store_true', help='Pick a random proxy from proxies.txt for each solve')
     parser.add_argument('--host', type=str, default='127.0.0.1', help='Specify the IP address where the API solver runs. (Default: 127.0.0.1)')
@@ -1847,11 +2762,17 @@ def create_app(
         proxy_support=proxy_support,
         close_delay=close_delay,
     )
+    server.app.config["DEBUG"] = bool(debug)
+    server.app.debug = bool(debug)
     return server.app
 
 
 if __name__ == '__main__':
     args = parse_args()
+    if args.browser_type == "playwrite":
+        args.browser_type = "playwright"
+    if args.browser_type in ("selenium", "sb"):
+        args.browser_type = "seleniumbase"
     browser_types = TurnstileAPIServer._supported_browser_types()
     
     if args.browser_type not in browser_types:
@@ -1859,6 +2780,8 @@ if __name__ == '__main__':
             logger.error(f"Playwright is not available. Please install playwright or use a different browser type. Available browser types: {browser_types}")
         elif args.browser_type == 'camoufox' and not CAMOUFOX_AVAILABLE:
             logger.error(f"Camoufox is not available. Please install camoufox or use a different browser type. Available browser types: {browser_types}")
+        elif args.browser_type in ('seleniumbase', 'selenium', 'sb') and not SELENIUMBASE_AVAILABLE:
+            logger.error(f"SeleniumBase is not available. Please install seleniumbase or use a different browser type. Available browser types: {browser_types}")
         else:
             logger.error(f"Unknown browser type: {COLORS.get('RED')}{args.browser_type}{COLORS.get('RESET')} Available browser types: {browser_types}")
     elif args.headless is True and args.useragent is None and args.browser_type != 'camoufox':
@@ -1880,4 +2803,4 @@ if __name__ == '__main__':
         # crashed this long-running solver with `PosixPath object is not
         # callable`, which resets API calls while the caller is waiting for the
         # first Turnstile session to be cached.
-        app.run(host=args.host, port=int(args.port), use_reloader=False)
+        app.run(host=args.host, port=int(args.port), debug=args.debug, use_reloader=False)

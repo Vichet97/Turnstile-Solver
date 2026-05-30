@@ -73,7 +73,7 @@ A Python-based Turnstile solver using the patchright library, featuring multi-th
    ```
 
 5. **Select the browser to install**:
-   You can choose between **Chromium**, **Chrome**, **Edge** or **Camoufox**:
+   You can choose between **Chromium**, **Chrome**, **Edge**, **Camoufox**, or **SeleniumBase (Chrome backend)**:
    - To install **Chromium**:
      ```bash
      python -m patchright install chromium
@@ -96,6 +96,10 @@ A Python-based Turnstile solver using the patchright library, featuring multi-th
      ```bash
      python -m camoufox fetch
      ```
+   - To install **SeleniumBase**:
+     ```bash
+     pip install seleniumbase
+     ```
 
 6. **Start testing**:
    - Run the script (Check [🔧 Command line arguments](#-command-line-arguments) for better setup):
@@ -110,12 +114,14 @@ A Python-based Turnstile solver using the patchright library, featuring multi-th
 |--------------|-----------|-----------|-----------------------------------------------------------------------------------------------|
 | `--headless`   | `False`  | `boolean` | Runs the browser in headless mode. Requires the `--useragent` argument to be set.             |
 | `--useragent`  | `None`   | `string`  | Specifies a custom User-Agent string for the browser. (No need to set if camoufox used)                                        |
-| `--debug`      | `False`  | `boolean` | Enables or disables debug mode for additional logging and troubleshooting.                   |
-| `--browser_type` | `chromium`  | `string` | Specify the browser type for the solver. Supported options: chromium, chrome, msedge, camoufox      |
+| `--debug`      | `False`  | `boolean` | Enables debug mode for solver logs and Quart server diagnostics.                   |
+| `--browser_type` | `seleniumbase`  | `string` | Specify the browser type for the solver. Supported options: chromium, playwright, chrome, msedge, camoufox, seleniumbase      |
 | `--thread`     | `1`      | `integer` | Sets the number of browser threads to use in multi-threaded mode.                           |
 | `--host`       | `127.0.0.1` | `string`  | Specifies the IP address the API solver runs on.                                            |
 | `--port`       | `5000`   | `integer` | Sets the port the API solver listens on.                                                    |
 | `--proxy`       | `False`   | `boolean` | Select a random proxy from proxies.txt for solving captchas                                                   |
+
+**SeleniumBase notes:** `--browser_type seleniumbase` uses SeleniumBase's Chrome backend and launches browsers per request (no persistent pool). `reverse_proxy` is supported in best-effort mode for SeleniumBase by bootstrapping through the worker URL and applying target-domain cookies from worker `Set-Cookie` headers when needed.
 
 ---
 
@@ -124,8 +130,28 @@ A Python-based Turnstile solver using the patchright library, featuring multi-th
 To start the container, use:
 - Change the TZ environment variable and ports to the correct one for yourself:
 ```sh
-docker run -d -p 3389:3389 -p 5000:5000 -e TZ=Asia/Baku --name turnstile_solver theyka/turnstile_solver:latest
+docker run -d --user 0:0 -p 3389:3389 -p 5000:5000 \
+  -e TZ=Asia/Baku \
+  -e RUN_API_SOLVER=true \
+  -e ENABLE_RDP_WITH_API=true \
+  --name turnstile_solver theyka/turnstile_solver:latest
 ```
+
+Virtual GUI defaults for Docker API mode (`RUN_API_SOLVER=true`) are tuned for Turnstile visibility:
+- `XVFB_SCREEN_WIDTH=1920`
+- `XVFB_SCREEN_HEIGHT=1080`
+- `XVFB_SCREEN_DEPTH=24`
+- `XVFB_DPI=96`
+- `SOLVER_VIEWPORT_WIDTH=1920`
+- `SOLVER_VIEWPORT_HEIGHT=1080`
+- `SOLVER_DEVICE_SCALE_FACTOR=1.0`
+- `SELENIUMBASE_PREWARM=true` (startup prewarm)
+- `SELENIUMBASE_PREFETCH_DRIVER=true` (prefetch chromedriver/uc_driver in `run.sh`)
+- `SELENIUMBASE_UC` optional override (`true`/`false`, default `false` for stability)
+
+If you need to view the GUI via RDP while API mode is running, enable:
+- `ENABLE_RDP_WITH_API=true`
+- run container as root (`user: "0:0"` in compose)
 
 #### Connecting to the Container
 1. Use an **RDP client** (like Windows Remote Desktop, Remmina, or FreeRDP)

@@ -1,11 +1,19 @@
 import sys
 import time
+import os
 import logging
 import asyncio
 from typing import Optional
 from dataclasses import dataclass
 from camoufox.async_api import AsyncCamoufox
 from patchright.async_api import async_playwright
+
+try:
+    from seleniumbase import Driver as SeleniumBaseDriver
+    SELENIUMBASE_AVAILABLE = True
+except ImportError:
+    SeleniumBaseDriver = None
+    SELENIUMBASE_AVAILABLE = False
 
 
 @dataclass
@@ -85,7 +93,7 @@ class AsyncTurnstileSolver:
     </html>
     """
 
-    def __init__(self, debug: bool = False, headless: Optional[bool] = False, useragent: Optional[str] = None, browser_type: str = "chromium"):
+    def __init__(self, debug: bool = False, headless: Optional[bool] = False, useragent: Optional[str] = None, browser_type: str = "seleniumbase"):
         self.debug = debug
         self.browser_type = browser_type
         self.headless = headless
@@ -137,10 +145,106 @@ class AsyncTurnstileSolver:
 
         return None
 
+    def _solve_with_seleniumbase_sync(self, url: str, sitekey: str, action: str = None, cdata: str = None):
+        start_time = time.time()
+        if not SELENIUMBASE_AVAILABLE:
+            return TurnstileResult(
+                turnstile_value=None,
+                elapsed_time_seconds=0.0,
+                status="failure",
+                reason="seleniumbase_not_installed",
+            )
+
+        def _uc_mode() -> bool:
+            raw = (os.environ.get("SELENIUMBASE_UC") or "").strip().lower()
+            if raw in {"1", "true", "yes", "on"}:
+                return True
+            if raw in {"0", "false", "no", "off"}:
+                return False
+            return False
+
+        def _create_driver():
+            kwargs = {
+                "browser": "chrome",
+                "headless": self.headless,
+                "agent": self.useragent,
+                "uc": _uc_mode(),
+                "window_size": "1920,1080",
+            }
+            kwargs = {k: v for k, v in kwargs.items() if v is not None}
+            try:
+                return SeleniumBaseDriver(**kwargs)
+            except Exception as first_error:
+                if kwargs.get("uc") is True:
+                    fallback_kwargs = dict(kwargs)
+                    fallback_kwargs["uc"] = False
+                    logger.warning(f"SeleniumBase UC launch failed; retrying with uc=False. error={first_error}")
+                    return SeleniumBaseDriver(**fallback_kwargs)
+                raise
+
+        driver = None
+        try:
+            driver = _create_driver()
+            url_with_slash = url + "/" if not url.endswith("/") else url
+            turnstile_div = f'<div class="cf-turnstile" data-sitekey="{sitekey}"' + (f' data-action="{action}"' if action else '') + (f' data-cdata="{cdata}"' if cdata else '') + '></div>'
+            page_data = self.HTML_TEMPLATE.replace("<!-- cf turnstile -->", turnstile_div)
+            driver.get(url_with_slash)
+            driver.execute_script(
+                "document.open();document.write(arguments[0]);document.close();",
+                page_data,
+            )
+
+            token_value = None
+            for _ in range(16):
+                token_value = driver.execute_script(
+                    "const el=document.querySelector('[name=\"cf-turnstile-response\"]'); return el && el.value ? el.value : '';"
+                ) or ""
+                if token_value:
+                    break
+                driver.execute_script(
+                    """
+                    const el = document.querySelector('div.cf-turnstile, .cf-turnstile, [data-sitekey], iframe[src*=\"turnstile\"]');
+                    if (el) { try { el.click(); } catch (e) {} }
+                    """
+                )
+                time.sleep(0.5)
+
+            elapsed_time = round(time.time() - start_time, 3)
+            if not token_value:
+                logger.error("Failed to retrieve Turnstile value.")
+                return TurnstileResult(
+                    turnstile_value=None,
+                    elapsed_time_seconds=elapsed_time,
+                    status="failure",
+                    reason="Max attempts reached without token retrieval",
+                )
+
+            logger.success(f"Successfully solved captcha: {token_value[:45]}... in {elapsed_time} seconds")
+            return TurnstileResult(
+                turnstile_value=token_value,
+                elapsed_time_seconds=elapsed_time,
+                status="success",
+            )
+        except Exception as e:
+            elapsed_time = round(time.time() - start_time, 3)
+            logger.error(f"SeleniumBase solve failed: {e}")
+            return TurnstileResult(
+                turnstile_value=None,
+                elapsed_time_seconds=elapsed_time,
+                status="failure",
+                reason=f"seleniumbase_exception: {e}",
+            )
+        finally:
+            if driver:
+                driver.quit()
+
     async def solve(self, url: str, sitekey: str, action: str = None, cdata: str = None):
         """
         Solve the Turnstile challenge and return the result.
         """
+        if self.browser_type == "seleniumbase":
+            return await asyncio.to_thread(self._solve_with_seleniumbase_sync, url, sitekey, action, cdata)
+
         start_time = time.time()
         if self.browser_type in ["chromium", "chrome", "msedge"]:
             playwright = await async_playwright().start()
@@ -191,7 +295,7 @@ class AsyncTurnstileSolver:
         return result
 
 
-async def get_turnstile_token(url: str, sitekey: str, action: str = None, cdata: str = None, debug: bool = False, headless: bool = False, useragent: str = None, browser_type: str = "chromium"):
+async def get_turnstile_token(url: str, sitekey: str, action: str = None, cdata: str = None, debug: bool = False, headless: bool = False, useragent: str = None, browser_type: str = "seleniumbase"):
     """Legacy wrapper function for backward compatibility."""
     browser_types = [
         'chromium',
@@ -199,6 +303,8 @@ async def get_turnstile_token(url: str, sitekey: str, action: str = None, cdata:
         'camoufox',
         'msedge'
     ]
+    if SELENIUMBASE_AVAILABLE:
+        browser_types.append('seleniumbase')
     if browser_type not in browser_types:
         logger.error(f"Unknown browser type: {COLORS.get('RED')}{browser_type}{COLORS.get('RESET')} Available browser types: {browser_types}")
     elif headless is True and useragent is None and "camoufox" not in browser_type:
@@ -218,6 +324,6 @@ if __name__ == "__main__":
         debug=True,
         headless=False,
         useragent=None,
-        browser_type="chromium"
+        browser_type="seleniumbase"
     ))
     print(result)

@@ -3,3 +3,4 @@ asyncio
 argparse
 patchright
 playwright
+seleniumbase
