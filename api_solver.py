@@ -82,7 +82,7 @@ logger.addHandler(handler)
 
 
 class TurnstileAPIServer:
-    DEFAULT_SOLVE_TIMEOUT_SECONDS = 45.0
+    DEFAULT_SOLVE_TIMEOUT_SECONDS = 120.0
     HTML_TEMPLATE = """
     <!DOCTYPE html>
     <html lang="en">
@@ -1098,6 +1098,28 @@ class TurnstileAPIServer:
         return "d" in names and "locl" in names
 
     @staticmethod
+    def _has_cf_clearance(cookies: List[Dict[str, Any]]) -> bool:
+        names = {c.get("name") for c in cookies}
+        return "cf_clearance" in names
+
+    @staticmethod
+    def _require_d_and_locl_only() -> bool:
+        raw = (os.environ.get("TURNSTILE_REQUIRE_D_LOCL") or "").strip().lower()
+        if raw in {"1", "true", "yes", "on"}:
+            return True
+        if raw in {"0", "false", "no", "off"}:
+            return False
+        # Default relaxed mode: accept cf_clearance-only sessions as usable.
+        return False
+
+    def _has_usable_session_cookies(self, cookies: List[Dict[str, Any]]) -> bool:
+        if self._has_d_and_locl(cookies):
+            return True
+        if self._require_d_and_locl_only():
+            return False
+        return self._has_cf_clearance(cookies)
+
+    @staticmethod
     def _d_locl_cookie_header(cookies: List[Dict[str, Any]]) -> str:
         by = {c.get("name"): c.get("value", "") for c in cookies if c.get("name") in ("d", "locl")}
         parts = []
@@ -1911,7 +1933,7 @@ class TurnstileAPIServer:
                     context=f"poll_loop_attempt_{attempt}",
                 )
 
-                if self._has_d_and_locl(cookies):
+                if self._has_usable_session_cookies(cookies):
                     session_via_dl = True
                     break
 
@@ -1934,7 +1956,7 @@ class TurnstileAPIServer:
                 context="post_loop_cookie_read",
             )
 
-            if rev_base and not self._has_d_and_locl(cookies) and proxied_doc_set_cookie_headers:
+            if rev_base and not self._has_usable_session_cookies(cookies) and proxied_doc_set_cookie_headers:
                 proxy_cookie_added = self._apply_reverse_proxy_cookies_to_target(
                     driver,
                     page_url,
@@ -1948,7 +1970,7 @@ class TurnstileAPIServer:
                         target_hosts,
                         context="post_reverse_proxy_cookie_apply",
                     )
-                    if self._has_d_and_locl(cookies):
+                    if self._has_usable_session_cookies(cookies):
                         session_via_dl = True
 
             cookie_header = self._format_cookie_header(cookies)
@@ -2020,12 +2042,12 @@ class TurnstileAPIServer:
                 payload["turnstile_token"] = None
                 if rev_base:
                     payload["note"] = (
-                        "Session cookies `d` and `locl` were captured in seleniumbase reverse_proxy mode "
+                        "Usable session cookies were captured in seleniumbase reverse_proxy mode "
                         "(worker Set-Cookie applied onto target domain when needed)."
                     )
                 else:
                     payload["note"] = (
-                        "Session cookies `d` and `locl` were detected in the jar; headers captured immediately."
+                        "Usable session cookies were detected in the jar; headers captured immediately."
                     )
             return payload
         except Exception as e:
@@ -2134,7 +2156,26 @@ class TurnstileAPIServer:
                 self._log_failure_payload(0, task_id, payload)
                 return
 
-        index, browser, effective_browser_type, release_browser = await self._acquire_browser(browser_type_override)
+        start_time = time.time()
+        try:
+            index, browser, effective_browser_type, release_browser = await self._acquire_browser(browser_type_override)
+        except Exception as e:
+            elapsed_time = round(time.time() - start_time, 3)
+            payload = await self._build_failure_payload(
+                elapsed_time=elapsed_time,
+                reason="embedded_solver_exception",
+                extra={
+                    "error": self._trim_text(e, 320),
+                    "url_initial": url,
+                    "sitekey": sitekey,
+                    "browser_type": effective_browser_type,
+                    "browser_backend": effective_browser_type,
+                },
+            )
+            self.results[task_id] = payload
+            self._save_results()
+            self._log_failure_payload(0, task_id, payload)
+            return
 
         try:
             proxy_cfg, proxy_label = self._pick_proxy_for_solve(proxy_cfg_override)
@@ -2373,7 +2414,27 @@ class TurnstileAPIServer:
                 self._log_failure_payload(0, task_id, payload)
                 return
 
-        index, browser, effective_browser_type, release_browser = await self._acquire_browser(browser_type_override)
+        start_time = time.time()
+        try:
+            index, browser, effective_browser_type, release_browser = await self._acquire_browser(browser_type_override)
+        except Exception as e:
+            elapsed_time = round(time.time() - start_time, 3)
+            payload = await self._build_failure_payload(
+                elapsed_time=elapsed_time,
+                reason="solver_exception",
+                extra={
+                    "error": self._trim_text(e, 320),
+                    "url_initial": url,
+                    "browser_type": effective_browser_type,
+                    "browser_backend": effective_browser_type,
+                    "reverse_proxy": reverse_proxy_base or "",
+                    "reverse_proxy_style": reverse_proxy_style,
+                },
+            )
+            self.results[task_id] = payload
+            self._save_results()
+            self._log_failure_payload(0, task_id, payload)
+            return
 
         try:
             proxy_cfg, proxy_label = self._pick_proxy_for_solve(proxy_cfg_override)
@@ -2573,10 +2634,12 @@ class TurnstileAPIServer:
                 for attempt in range(200):
                     jar = await _filtered_jar()
 
-                    if self._has_d_and_locl(jar):
+                    if self._has_usable_session_cookies(jar):
                         session_via_dl = True
                         if self.debug:
-                            logger.debug(f"Browser {index}: d + locl detected (attempt {attempt}), capturing now")
+                            logger.debug(
+                                f"Browser {index}: session cookies detected (attempt {attempt}), capturing now"
+                            )
                         break
 
                     turnstile_check = await self._read_turnstile_token(page)
@@ -2620,7 +2683,7 @@ class TurnstileAPIServer:
 
                         if hosts:
                             cookies = [c for c in cookies if _cookie_matches_inner(hosts, c.get("domain", ""))]
-                        if self._has_d_and_locl(cookies):
+                        if self._has_usable_session_cookies(cookies):
                             try:
                                 await page.reload(wait_until="domcontentloaded", timeout=90000)
                             except Exception:
@@ -2646,12 +2709,11 @@ class TurnstileAPIServer:
                         pass
 
                     if sess.get("cookie_header"):
-                        failure_reason = "partial_session_cookies_only"
                         sess["value"] = ""
+                        sess["result_mode"] = "session_captured"
                         sess["turnstile_token"] = None
                         sess["note"] = (
-                            "No cf-turnstile-response field found; session cookies and request headers were captured "
-                            "(e.g. Cloudflare clearance / site cookies only)."
+                            "No cf-turnstile-response field was found; usable session cookies and headers were captured."
                         )
                         logger.success(
                             f"Browser {index}: Session cookies captured (no Turnstile widget token) in "

@@ -72,11 +72,16 @@ COPY . .
 
 # Create a non-root user for security
 RUN useradd -m -u 1000 appuser && chown -R appuser:appuser /app
-USER appuser
 
-# Install browser runtimes as the non-root user
+# Keep browser cache in a shared path so both root and non-root runtime users
+# (e.g. docker-compose user:0) see the same installed browser binaries.
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+
+# Install browser runtimes at build time
 RUN python -m patchright install chromium && \
     python -m playwright install chromium
+
+USER appuser
 
 # Expose port 5000
 EXPOSE 5000

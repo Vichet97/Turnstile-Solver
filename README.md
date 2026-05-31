@@ -133,7 +133,7 @@ python api_solver.py --help
 | `sitekey` | No | `None` | If provided, uses embedded widget flow. If omitted, solves on real page flow. |
 | `action` | No | `None` | Extra Turnstile action (mainly for embedded/sitekey flow). |
 | `cdata` | No | `None` | Extra Turnstile cdata (mainly for embedded/sitekey flow). |
-| `timeout` | No | `45` | Per-task timeout in seconds. Clamped to max `86400`. |
+| `timeout` | No | `120` | Per-task timeout in seconds. Clamped to max `86400`. |
 | `browser` or `browser_type` | No | server default | Per-request backend override. Aliases accepted: `playwrite`→`playwright`, `selenium`/`sb`→`seleniumbase`. |
 | `proxy` | No | `None` | Per-request outbound proxy override. Supports multiple formats (see [Proxy details](#proxy-and-reverse-proxy-details)). |
 | `reverse_proxy` | No | `None` | Worker reverse-proxy base URL. Optional `/SCHEMA` suffix forces full-style tails. |
@@ -348,7 +348,7 @@ Current `docker-compose.yml` maps:
 
 - API: `5510 -> 5000`
 - RDP: `3333 -> 3389`
-- UC mode: `SELENIUMBASE_UC=true` (explicit in compose)
+- UC mode: `SELENIUMBASE_UC=false` (explicit in compose; stability default)
 - GUI click helper: `SELENIUMBASE_GUI_CLICK=false` (explicit in compose)
 
 So use:
@@ -382,6 +382,7 @@ docker compose logs -f --tail=200
 | `SELENIUMBASE_PREWARM` | `true` | Prewarm SeleniumBase driver at startup. |
 | `SELENIUMBASE_PREFETCH_DRIVER` | `true` | Run `sbase get chromedriver` / `uc_driver` prefetch on startup. |
 | `SELENIUMBASE_GUI_CLICK` | `false` (recommended in Docker) | Enables SeleniumBase GUI click helpers; disabled by default for stability. |
+| `TURNSTILE_REQUIRE_D_LOCL` | `false` | If `true`, only `d+locl` counts as a successful session capture; if `false`, `cf_clearance`-only captures are also accepted. |
 | `XVFB_SCREEN_WIDTH` | `1920` | Xvfb virtual screen width. |
 | `XVFB_SCREEN_HEIGHT` | `1080` | Xvfb virtual screen height. |
 | `XVFB_SCREEN_DEPTH` | `24` | Xvfb color depth. |
@@ -427,7 +428,7 @@ python api_solver.py --headless --useragent "Mozilla/5.0 (...)" \
 
 ### 6) SeleniumBase shows a proxy username/password popup
 - Check startup/request logs for `proxy_auth=True` on accepted tasks.
-- For authenticated HTTP(S) proxy with UC mode on recent Chrome, keep `SELENIUMBASE_UC=true` so SeleniumBase can use CDP-mode proxy-auth flow.
+- For authenticated HTTP(S) proxy, test both `SELENIUMBASE_UC=false` and `SELENIUMBASE_UC=true` depending on provider behavior.
 - If popup still appears, URL-encode the `proxy` value and retry.
 - A/B test with `browser=playwright` using the same proxy to confirm credentials/network path.
 
