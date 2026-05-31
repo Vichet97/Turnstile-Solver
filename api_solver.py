@@ -517,6 +517,7 @@ class TurnstileAPIServer:
     ) -> int:
         if not set_cookie_headers:
             return 0
+        self._seleniumbase_ensure_connected(driver, context="reverse_proxy_cookie_bootstrap")
         parsed_target = urlparse(target_url)
         target_host = (parsed_target.hostname or "").lower()
         if not target_host:
@@ -525,7 +526,12 @@ class TurnstileAPIServer:
         try:
             driver.get(bootstrap)
         except Exception:
-            return 0
+            if not self._seleniumbase_ensure_connected(driver, context="reverse_proxy_cookie_bootstrap_get"):
+                return 0
+            try:
+                driver.get(bootstrap)
+            except Exception:
+                return 0
 
         added = 0
         for raw_cookie in set_cookie_headers:
@@ -536,6 +542,13 @@ class TurnstileAPIServer:
                 driver.add_cookie(cookie)
                 added += 1
             except Exception:
+                if self._seleniumbase_ensure_connected(driver, context="reverse_proxy_cookie_add"):
+                    try:
+                        driver.add_cookie(cookie)
+                        added += 1
+                        continue
+                    except Exception:
+                        pass
                 continue
         return added
 
@@ -702,6 +715,10 @@ class TurnstileAPIServer:
                     if self.debug:
                         logger.debug("Browser SB: UC + proxy auth detected; navigating via CDP mode")
                     cdp_activate(url)
+                    # CDP activation can leave raw WebDriver socket disconnected.
+                    # Reconnect now because downstream solver logic uses
+                    # WebDriver cookie/script APIs.
+                    self._seleniumbase_ensure_connected(driver, context="post_uc_cdp_activate")
                     return
                 except Exception as cdp_error:
                     if self.debug:
@@ -714,6 +731,85 @@ class TurnstileAPIServer:
             nav_fn(url)
             return
         driver.get(url)
+
+    def _seleniumbase_ensure_connected(self, driver, context: str = "") -> bool:
+        """Best-effort reconnect for UC/CDP flows before raw WebDriver-only commands."""
+        if driver is None:
+            return False
+
+        is_connected_fn = getattr(driver, "is_connected", None)
+        connected = True
+        if callable(is_connected_fn):
+            try:
+                connected = bool(is_connected_fn())
+            except Exception:
+                connected = True
+        if connected:
+            return True
+
+        reconnect_error = None
+        reconnect_fn = getattr(driver, "reconnect", None)
+        if callable(reconnect_fn):
+            try:
+                reconnect_fn(timeout=0.1)
+            except TypeError:
+                try:
+                    reconnect_fn(0.1)
+                except Exception as e:
+                    reconnect_error = e
+            except Exception as e:
+                reconnect_error = e
+        else:
+            connect_fn = getattr(driver, "connect", None)
+            if callable(connect_fn):
+                try:
+                    connect_fn()
+                except Exception as e:
+                    reconnect_error = e
+
+        if callable(is_connected_fn):
+            try:
+                if bool(is_connected_fn()):
+                    if self.debug:
+                        logger.debug(
+                            "Browser SB: WebDriver reconnected%s",
+                            f" ({context})" if context else "",
+                        )
+                    return True
+            except Exception:
+                pass
+
+        if self.debug:
+            logger.warning(
+                "Browser SB: WebDriver reconnect attempt failed%s. error=%s",
+                f" ({context})" if context else "",
+                self._trim_text(reconnect_error, 220) if reconnect_error else "unknown",
+            )
+        return False
+
+    def _seleniumbase_get_cookies_safe(
+        self,
+        driver,
+        hosts: Set[str],
+        *,
+        context: str = "",
+    ) -> List[Dict[str, Any]]:
+        """Fetch cookies with a reconnect retry on transient UC/CDP disconnects."""
+        try:
+            return self._filter_cookies_for_hosts(driver.get_cookies(), hosts)
+        except Exception as first_error:
+            if self._seleniumbase_ensure_connected(driver, context=f"{context}:get_cookies_retry"):
+                try:
+                    return self._filter_cookies_for_hosts(driver.get_cookies(), hosts)
+                except Exception as second_error:
+                    raise RuntimeError(
+                        "Unable to fetch SeleniumBase cookies after reconnect attempt: "
+                        f"{self._trim_text(second_error, 220)}"
+                    ) from second_error
+            raise RuntimeError(
+                "Unable to fetch SeleniumBase cookies; WebDriver appears disconnected: "
+                f"{self._trim_text(first_error, 220)}"
+            ) from first_error
 
     def _seleniumbase_uc_mode(self) -> bool:
         raw = (os.environ.get("SELENIUMBASE_UC") or "").strip().lower()
@@ -1809,7 +1905,11 @@ class TurnstileAPIServer:
                 except Exception:
                     current_host = init_host
                 hosts = {h for h in (init_host, current_host) if h}
-                cookies = self._filter_cookies_for_hosts(driver.get_cookies(), hosts)
+                cookies = self._seleniumbase_get_cookies_safe(
+                    driver,
+                    hosts,
+                    context=f"poll_loop_attempt_{attempt}",
+                )
 
                 if self._has_d_and_locl(cookies):
                     session_via_dl = True
@@ -1828,7 +1928,11 @@ class TurnstileAPIServer:
             except Exception:
                 final_host = init_host
             hosts = {h for h in (init_host, final_host) if h}
-            cookies = self._filter_cookies_for_hosts(driver.get_cookies(), hosts)
+            cookies = self._seleniumbase_get_cookies_safe(
+                driver,
+                hosts,
+                context="post_loop_cookie_read",
+            )
 
             if rev_base and not self._has_d_and_locl(cookies) and proxied_doc_set_cookie_headers:
                 proxy_cookie_added = self._apply_reverse_proxy_cookies_to_target(
@@ -1839,7 +1943,11 @@ class TurnstileAPIServer:
                 if proxy_cookie_added:
                     target_host = (urlparse(page_url).hostname or "").lower()
                     target_hosts = {target_host} if target_host else set()
-                    cookies = self._filter_cookies_for_hosts(driver.get_cookies(), target_hosts)
+                    cookies = self._seleniumbase_get_cookies_safe(
+                        driver,
+                        target_hosts,
+                        context="post_reverse_proxy_cookie_apply",
+                    )
                     if self._has_d_and_locl(cookies):
                         session_via_dl = True
 
