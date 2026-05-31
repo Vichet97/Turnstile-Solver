@@ -648,10 +648,16 @@ class TurnstileAPIServer:
         username = (proxy.get("username") or "").strip()
         password = (proxy.get("password") or "").strip()
         auth = f"{username}:{password}@" if username or password else ""
-        base = f"{auth}{host}:{port}"
-        if scheme.startswith("socks"):
-            return f"{scheme}://{base}"
-        return base
+
+        target = f"{host}:{port}"
+        # SeleniumBase proxy auth parser expects:
+        #   username:password@hostname:port          (HTTP)
+        #   username:password@https://hostname:port  (HTTPS)
+        # Keep scheme only when not plain HTTP so proxy protocol survives.
+        if scheme and scheme != "http":
+            target = f"{scheme}://{target}"
+
+        return f"{auth}{target}"
 
     def _build_seleniumbase_driver_kwargs(
         self,
@@ -670,6 +676,44 @@ class TurnstileAPIServer:
         if proxy_str:
             kwargs["proxy"] = proxy_str
         return {k: v for k, v in kwargs.items() if v is not None}
+
+    @staticmethod
+    def _proxy_has_auth(proxy_cfg: Optional[Dict[str, str]]) -> bool:
+        if not proxy_cfg:
+            return False
+        return bool((proxy_cfg.get("username") or "").strip() or (proxy_cfg.get("password") or "").strip())
+
+    def _seleniumbase_open_url(self, driver, url: str, proxy_cfg: Optional[Dict[str, str]] = None) -> None:
+        """
+        Open URL with SeleniumBase driver while accounting for UC + authenticated proxy behavior.
+
+        SeleniumBase maintainer guidance for recent Chrome versions indicates that
+        UC mode with authenticated proxy may require CDP mode activation before
+        browsing for auth to take effect.
+        """
+        use_uc = self._seleniumbase_uc_mode()
+        proxy_auth = self._proxy_has_auth(proxy_cfg)
+        if use_uc and proxy_auth:
+            cdp_activate = getattr(driver, "uc_activate_cdp_mode", None)
+            if not callable(cdp_activate):
+                cdp_activate = getattr(driver, "activate_cdp_mode", None)
+            if callable(cdp_activate):
+                try:
+                    if self.debug:
+                        logger.debug("Browser SB: UC + proxy auth detected; navigating via CDP mode")
+                    cdp_activate(url)
+                    return
+                except Exception as cdp_error:
+                    if self.debug:
+                        logger.warning(
+                            "Browser SB: CDP navigation failed for UC + proxy auth; falling back to Selenium get(). error=%s",
+                            self._trim_text(cdp_error, 240),
+                        )
+        nav_fn = getattr(driver, "default_get", None) if use_uc else None
+        if callable(nav_fn):
+            nav_fn(url)
+            return
+        driver.get(url)
 
     def _seleniumbase_uc_mode(self) -> bool:
         raw = (os.environ.get("SELENIUMBASE_UC") or "").strip().lower()
@@ -1593,7 +1637,7 @@ class TurnstileAPIServer:
             if not url_with_slash.endswith("/"):
                 url_with_slash += "/"
 
-            driver.get(url_with_slash)
+            self._seleniumbase_open_url(driver, url_with_slash, proxy_cfg)
             turnstile_div = (
                 '<div class="cf-turnstile" style="background: white;" data-sitekey="' + sitekey + '"'
                 + (f' data-action="{action}"' if action else "")
@@ -1730,14 +1774,7 @@ class TurnstileAPIServer:
                         proxied_doc_error,
                     )
 
-            if self._seleniumbase_uc_mode() and rev_base:
-                nav_fn = getattr(driver, "default_get", None)
-                if callable(nav_fn):
-                    nav_fn(nav_url)
-                else:
-                    driver.get(nav_url)
-            else:
-                driver.get(nav_url)
+            self._seleniumbase_open_url(driver, nav_url, proxy_cfg)
             time.sleep(1.5)
             self._seleniumbase_click_turnstile(driver)
 
@@ -2718,7 +2755,7 @@ class TurnstileAPIServer:
         self.results[task_id] = "CAPTCHA_NOT_READY"
         logger.info(
             "Turnstile request accepted | task_id=%s url=%s sitekey=%s browser=%s headless=%s timeout=%s "
-            "proxy_override=%s reverse_proxy=%s reverse_proxy_style=%s thread=%s",
+            "proxy_override=%s proxy_auth=%s reverse_proxy=%s reverse_proxy_style=%s thread=%s",
             task_id,
             self._trim_text(url, 180),
             "provided" if sitekey else "none",
@@ -2726,6 +2763,7 @@ class TurnstileAPIServer:
             self.headless,
             solve_timeout,
             proxy_cfg_override.get("server") if proxy_cfg_override else None,
+            bool(self._proxy_has_auth(proxy_cfg_override)),
             reverse_proxy_base or None,
             reverse_proxy_style_effective,
             self.thread_count,

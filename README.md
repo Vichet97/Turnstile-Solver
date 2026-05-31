@@ -322,6 +322,8 @@ Examples:
 - `socks5:1.2.3.4:1080`
 
 > Chromium-family backends (`chromium`, `chrome`, `msedge`, `seleniumbase`) do **not** support authenticated SOCKS proxies. Use unauthenticated SOCKS, HTTP(S) auth proxy, or `camoufox`.
+>
+> If your proxy username/password contains reserved URL characters (`@`, `:`, `#`, `&`, `%`, `+`, etc.), URL-encode the whole `proxy` query value when calling `/turnstile`.
 
 ### Reverse-proxy routing
 
@@ -422,6 +424,12 @@ python api_solver.py --headless --useragent "Mozilla/5.0 (...)" \
 - Verify worker path style: `host` vs `full`.
 - Try `/SCHEMA` suffix on `reverse_proxy` if worker expects `https://...` tail.
 - Check `ALLOWED_REVERSE_PROXY_HOSTS` and `REVERSE_PROXY_BYPASS_HOSTS`.
+
+### 6) SeleniumBase shows a proxy username/password popup
+- Check startup/request logs for `proxy_auth=True` on accepted tasks.
+- For authenticated HTTP(S) proxy with UC mode on recent Chrome, keep `SELENIUMBASE_UC=true` so SeleniumBase can use CDP-mode proxy-auth flow.
+- If popup still appears, URL-encode the `proxy` value and retry.
+- A/B test with `browser=playwright` using the same proxy to confirm credentials/network path.
 
 ---
 
