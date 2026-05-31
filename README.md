@@ -1,253 +1,432 @@
-<div align="center">
- 
-  <h2 align="center">Cloudflare - Turnstile Solver</h2>
-  <p align="center">
-A Python-based Turnstile solver using the patchright library, featuring multi-threaded execution, API integration, and support for different browsers. It solves CAPTCHAs quickly and efficiently, with customizable configurations and detailed logging.
-    <br />
-    <br />
-    <a href="https://github.com/Theyka/Turnstile-Solver#-changelog">📜 ChangeLog</a>
-    ·
-    <a href="https://github.com/Theyka/Turnstile-Solver/issues">⚠️ Report Bug</a>
-    ·
-    <a href="https://github.com/Theyka/Turnstile-Solver/issues">💡 Request Feature</a>
-  </p>
+# Turnstile Solver
 
-  <p align="center">
-    <img src="https://img.shields.io/badge/LICENSE-CC%20BY%20NC%204.0-red?style=for-the-badge"/>
-    <img src="https://img.shields.io/github/stars/Theyka/Turnstile-Solver.svg?style=for-the-badge&color=red"/>
-    <img src="https://img.shields.io/github/issues/Theyka/Turnstile-Solver?style=for-the-badge&color=red"/>
-    <a href="https://t.me/codarea">
-     <img src="https://img.shields.io/badge/Telegram%20Channel-2CA5E0?style=for-the-badge&logo=telegram&logoColor=white"/>
-    </a>
-  </p>
-</div>
+A Python-based Cloudflare Turnstile solver with two usage styles:
+
+1. **API mode** (recommended for integrations): async task endpoint + polling.
+2. **Command mode** (direct solve): call sync/async solver functions directly.
 
 ---
 
-### 🎁 Donation
+## Table of Contents
 
-- **USDT (TRC20)**: ``TWXNQCnJESt6gxNMX5oHKwQzq4gsbdLNRh``
-- **USDT (Arbitrum One)**: ``0xd8fd1e91c8af318a74a0810505f60ccca4ca0f8c``
-- **BTC**: ``13iiMaYFpCfNdcyFycSdSVmD2yfQciD7AQ``
-- **LTC**: ``LSrLQe2dfpDhGgVvDTRwW72fSyC9VsXp9g``
-
----
-
-### ❓ Looking for a Cheap or Custom CAPTCHA Solution?
-- Need cheap captcha solution as low as 0.1$ per 1k ? Contact me on Telegram:
-
-  <a href="https://t.me/tlb_sh">
-    <img src="https://img.shields.io/badge/Telegram-2CA5E0?style=for-the-badge&logo=telegram&logoColor=white"/>
-  </a>
-
----
-
-### ❗ Disclaimers
-- I am not responsible for anything that may happen, such as API Blocking, IP ban, etc.
-- This was a quick project that was made for fun and personal use if you want to see further updates, star the repo & create an "issue" [here](https://github.com/Theyka/Turnstile-Solver/issues/)
-
----
-
-### ⚙️ Installation Instructions
-
-1. **Ensure Python 3.8+ is installed** on your system.
-
-2. **Create a Python virtual environment**:
-   ```bash
-   python -m venv venv
-   ```
-
-3. **Activate the virtual environment**:
-   - On **Windows**:
-     ```bash
-     venv\Scripts\activate
-     ```
-   - On **macOS/Linux**:
-     ```bash
-     source venv/bin/activate
-     ```
-
-4. **Install required dependencies**:
-   ```bash
-   pip install -r requirements.txt
-   ```
-
-5. **Select the browser to install**:
-   You can choose between **Chromium**, **Chrome**, **Edge**, **Camoufox**, or **SeleniumBase (Chrome backend)**:
-   - To install **Chromium**:
-     ```bash
-     python -m patchright install chromium
-     ```
-   - To install **Chrome**:
-     - On **macOS/Windows**: [Click here](https://www.google.com/chrome/)  
-     - On **Linux (Debian/Ubuntu-based)**:
-       ```bash
-       apt update
-       wget https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
-       apt install -y ./google-chrome-stable_current_amd64.deb
-       apt -f install -y  # Fix dependencies if needed
-       rm ./google-chrome-stable_current_amd64.deb
-       ```
-   - To install **Edge**:
-     ```bash
-     python -m patchright install msedge
-     ```
-   - To install **Camoufox**:
-     ```bash
-     python -m camoufox fetch
-     ```
-   - To install **SeleniumBase**:
-     ```bash
-     pip install seleniumbase
-     ```
-
-6. **Start testing**:
-   - Run the script (Check [🔧 Command line arguments](#-command-line-arguments) for better setup):
-     ```bash
-     python api_solver.py
-     ```
-     
----
-
-### 🔧 Command line arguments
-| Parameter     | Default   | Type      | Description                                                                                   |
-|--------------|-----------|-----------|-----------------------------------------------------------------------------------------------|
-| `--headless`   | `False`  | `boolean` | Runs the browser in headless mode. Requires the `--useragent` argument to be set.             |
-| `--useragent`  | `None`   | `string`  | Specifies a custom User-Agent string for the browser. (No need to set if camoufox used)                                        |
-| `--debug`      | `False`  | `boolean` | Enables debug mode for solver logs and Quart server diagnostics.                   |
-| `--browser_type` | `seleniumbase`  | `string` | Specify the browser type for the solver. Supported options: chromium, playwright, chrome, msedge, camoufox, seleniumbase      |
-| `--thread`     | `1`      | `integer` | Sets the number of browser threads to use in multi-threaded mode.                           |
-| `--host`       | `127.0.0.1` | `string`  | Specifies the IP address the API solver runs on.                                            |
-| `--port`       | `5000`   | `integer` | Sets the port the API solver listens on.                                                    |
-| `--proxy`       | `False`   | `boolean` | Select a random proxy from proxies.txt for solving captchas                                                   |
-
-**SeleniumBase notes:** `--browser_type seleniumbase` uses SeleniumBase's Chrome backend and launches browsers per request (no persistent pool). `reverse_proxy` is supported in best-effort mode for SeleniumBase by bootstrapping through the worker URL and applying target-domain cookies from worker `Set-Cookie` headers when needed.
+- [What this project can return](#what-this-project-can-return)
+- [Install](#install)
+- [Mode 1: API mode](#mode-1-api-mode)
+  - [Start API server](#start-api-server)
+  - [API server CLI options](#api-server-cli-options)
+  - [Endpoints](#endpoints)
+  - [API request options (`/turnstile`)](#api-request-options-turnstile)
+  - [API examples](#api-examples)
+  - [Response/result modes](#responseresult-modes)
+- [Mode 2: Command mode (direct solve)](#mode-2-command-mode-direct-solve)
+  - [Interactive launcher](#interactive-launcher)
+  - [Sync example](#sync-example)
+  - [Async example](#async-example)
+  - [Command-mode options](#command-mode-options)
+- [Proxy and reverse-proxy details](#proxy-and-reverse-proxy-details)
+- [Docker + RDP usage](#docker--rdp-usage)
+  - [Compose defaults in this repo](#compose-defaults-in-this-repo)
+  - [Docker runtime environment options](#docker-runtime-environment-options)
+- [Troubleshooting](#troubleshooting)
 
 ---
 
-### 🐳 Docker Image
-#### Running the Container
-To start the container, use:
-- Change the TZ environment variable and ports to the correct one for yourself:
-```sh
-docker run -d --user 0:0 -p 3389:3389 -p 5000:5000 \
-  -e TZ=Asia/Baku \
-  -e RUN_API_SOLVER=true \
-  -e ENABLE_RDP_WITH_API=true \
-  --name turnstile_solver theyka/turnstile_solver:latest
+## What this project can return
+
+Depending on target behavior, the solver may return:
+
+- **Turnstile token** (`value`)
+- **Session cookies / headers capture** (when token is not directly exposed but useful cookies are available)
+- **Failure payload** with reason + diagnostics
+
+---
+
+## Install
+
+### 1) Python environment
+
+```bash
+python -m venv .venv
 ```
 
-Virtual GUI defaults for Docker API mode (`RUN_API_SOLVER=true`) are tuned for Turnstile visibility:
-- `XVFB_SCREEN_WIDTH=1920`
-- `XVFB_SCREEN_HEIGHT=1080`
-- `XVFB_SCREEN_DEPTH=24`
-- `XVFB_DPI=96`
-- `SOLVER_VIEWPORT_WIDTH=1920`
-- `SOLVER_VIEWPORT_HEIGHT=1080`
-- `SOLVER_DEVICE_SCALE_FACTOR=1.0`
-- `SELENIUMBASE_PREWARM=true` (startup prewarm)
-- `SELENIUMBASE_PREFETCH_DRIVER=true` (prefetch chromedriver/uc_driver in `run.sh`)
-- `SELENIUMBASE_UC` optional override (`true`/`false`, default `false` for stability)
-- `SELENIUMBASE_GUI_CLICK` optional (`false` recommended in Docker unless `python3-tk` is installed)
+- Windows:
+  ```bash
+  .venv\Scripts\activate
+  ```
+- macOS/Linux:
+  ```bash
+  source .venv/bin/activate
+  ```
 
-If you need to view the GUI via RDP while API mode is running, enable:
-- `ENABLE_RDP_WITH_API=true`
-- run container as root (`user: "0:0"` in compose)
-- set `SOLVER_DISPLAY_MODE=rdp` so headed Selenium windows render inside the XRDP session
-- optional: set `XRDP_PASSWORD` (defaults to `root` if unset)
+### 2) Install dependencies
 
-#### Connecting to the Container
-1. Use an **RDP client** (like Windows Remote Desktop, Remmina, or FreeRDP)
-2. Connect to `localhost:3389`
-3. Login with the default user:
-   - **Username:** root
-   - **Password:** root
-4. After this, you can start the solver by navigating to the `Turnstile-Solver` folder.
+```bash
+pip install -r requirements.txt
+```
+
+### 3) Install browser runtimes (as needed)
+
+- Patchright Chromium (used by `chromium`, `chrome`, `msedge` modes):
+  ```bash
+  python -m patchright install chromium
+  ```
+
+- Native Playwright Chromium (used by `playwright` mode):
+  ```bash
+  python -m playwright install chromium
+  ```
+
+- Camoufox (optional):
+  ```bash
+  python -m camoufox fetch
+  ```
+
+- SeleniumBase (already in requirements):
+  - driver binaries can auto-download on first run
+  - optionally prefetch:
+    ```bash
+    sbase get chromedriver
+    sbase get uc_driver
+    ```
 
 ---
 
-### 📡 API Documentation
-#### Solve turnstile
-```http
-  GET /turnstile?url=https://example.com&sitekey=0x4AAAAAAA
-```
-#### Request Parameters:
-| Parameter  | Type    | Description                                                                 | Required |
-|------------|---------|-----------------------------------------------------------------------------|----------|
-| `url`      | string  | The target URL containing the CAPTCHA. (e.g., `https://example.com`) | Yes      |
-| `sitekey`  | string  | The site key for the CAPTCHA to be solved. (e.g., `0x4AAAAAAA`) | Yes      |
-| `action`   | string  | Action to trigger during CAPTCHA solving, e.g., `login`            | No       |
-| `cdata`    | string  | Custom data that can be used for additional CAPTCHA parameters.    | No       |
-| `timeout`  | number  | Max solve time in seconds. | No |
-| `proxy`    | string  | Outbound proxy for this job. Supported schemes: `http`, `https`, `socks5`, and `socks4`. Supported formats: `scheme://host:port`, `scheme://user:pass@host:port`, `scheme:host:port`, `scheme:host:port:user:pass`, or `scheme:user:pass:host:port` (examples: `?proxy=http:user:pass:ip:port`, `?proxy=http://user:pass@ip:port`, `?proxy=https:user:pass:ip:port`). SOCKS auth like `?proxy=socks5:user:pass:ip:port` is parsed, but Chromium cannot use authenticated SOCKS; use unauthenticated `socks5:ip:port`, HTTP(S) auth, or camoufox. | No |
-| `reverse_proxy` | string | Worker base URL. Optional path suffix **`/SCHEMA`** (case-sensitive): strip it from the base and force **full** tails (`…/https://goplay.ml/`). Without **`/SCHEMA`**, default tails omit the scheme (`…/goplay.ml/`); override with `reverse_proxy_style=full` if needed. | No |
-| `reverse_proxy_style` | string | `host` (default) = tail is `hostname/path…` (no `https://` in path). `full` = tail includes scheme. Ignored when `reverse_proxy` ends with **`/SCHEMA`**. | No |
+## Mode 1: API mode
 
-**Environment:** Optional `ALLOWED_REVERSE_PROXY_HOSTS` — comma-separated hostnames allowed for `reverse_proxy` (e.g. `as.mykhcdn.workers.dev`). If unset, any host is allowed.
+### Start API server
 
-`REVERSE_PROXY_BYPASS_HOSTS` controls hosts that stay direct even when `reverse_proxy` is enabled. Default: `challenges.cloudflare.com`, because Cloudflare Turnstile assets commonly return `403` when fetched through a generic worker prefix.
-
-When `reverse_proxy` is enabled, the solver fetches the worker URL internally and fulfills the original browser request instead of navigating the browser to the worker URL. This keeps cookies scoped to the protected target host (for example `.goplay.ml`) so target-domain session cookies are accepted by Chromium.
-
-Prefix-style reverse proxy examples:
-
-```http
-GET /turnstile?url=https%3A%2F%2Fhttpbin.org%2Fheaders&timeout=90&reverse_proxy=https%3A%2F%2Fas.mykhcdn.workers.dev%2F
+```bash
+python api_solver.py
 ```
 
-With the default `reverse_proxy_style=host`, browser requests are routed like:
+Default bind is `127.0.0.1:5000`.
 
-```text
-https://httpbin.org/headers -> https://as.mykhcdn.workers.dev/httpbin.org/headers
+### API server CLI options
+
+```bash
+python api_solver.py --help
 ```
 
-Use `reverse_proxy_style=full` (or end `reverse_proxy` with `/SCHEMA`) only when the worker expects the scheme in the path:
+| Option | Default | Type | Description |
+|---|---:|---|---|
+| `--headless` | `False` | flag | Run browser headless. For non-camoufox browsers, you must also set `--useragent`. |
+| `--useragent` | `None` | string | Custom User-Agent. |
+| `--debug` | `False` | flag | Enable solver debug logs + Quart debug diagnostics. |
+| `--browser_type` | `seleniumbase` | string | Default backend: `chromium`, `playwright`, `chrome`, `msedge`, `camoufox` (if installed), `seleniumbase` (if installed). |
+| `--thread` | `1` | int | Browser worker count for pooled async backends. |
+| `--proxy` | `False` | flag | Enable random proxy selection from `proxies.txt`. |
+| `--host` | `127.0.0.1` | string | API bind host. |
+| `--port` | `5000` | int/string | API bind port. |
+| `--close-delay` | `0` | float seconds | Keep page open before cleanup (helps debugging visual flow). |
 
-```text
-https://httpbin.org/headers -> https://as.mykhcdn.workers.dev/https://httpbin.org/headers
+### Endpoints
+
+- `GET /turnstile` → submit solve task (returns `202` + `task_id`)
+- `GET /result?id=<task_id>` → fetch raw result payload
+- `GET /describe?id=<task_id>` → fetch normalized summary/classification
+
+### API request options (`/turnstile`)
+
+| Query param | Required | Default | Description |
+|---|---|---|---|
+| `url` | Yes | — | Target URL. If scheme is omitted, `https://` is assumed. |
+| `sitekey` | No | `None` | If provided, uses embedded widget flow. If omitted, solves on real page flow. |
+| `action` | No | `None` | Extra Turnstile action (mainly for embedded/sitekey flow). |
+| `cdata` | No | `None` | Extra Turnstile cdata (mainly for embedded/sitekey flow). |
+| `timeout` | No | `45` | Per-task timeout in seconds. Clamped to max `86400`. |
+| `browser` or `browser_type` | No | server default | Per-request backend override. Aliases accepted: `playwrite`→`playwright`, `selenium`/`sb`→`seleniumbase`. |
+| `proxy` | No | `None` | Per-request outbound proxy override. Supports multiple formats (see [Proxy details](#proxy-and-reverse-proxy-details)). |
+| `reverse_proxy` | No | `None` | Worker reverse-proxy base URL. Optional `/SCHEMA` suffix forces full-style tails. |
+| `reverse_proxy_style` | No | `host` | `host` or `full`. Ignored when `reverse_proxy` ends with `/SCHEMA`. |
+
+### API examples
+
+#### A) Submit with explicit sitekey (embedded flow)
+
+```bash
+curl "http://127.0.0.1:5000/turnstile?url=https://example.com&sitekey=0x4AAAAAAA"
 ```
 
-#### Response:
+#### B) Submit without sitekey (real-page flow)
 
-If the request is successfully received, the server will respond with a `task_id` for the CAPTCHA solving task:
-
-```json
-{
-  "task_id": "d2cbb257-9c37-4f9c-9bc7-1eaee72d96a8"
-}
+```bash
+curl "http://127.0.0.1:5000/turnstile?url=https://goplay.ml"
 ```
 
-#### Get Result
-```http
-  GET /result?id=f0dbe75b-fa76-41ad-89aa-4d3a392040af
+#### C) Submit with timeout + browser override
+
+```bash
+curl "http://127.0.0.1:5000/turnstile?url=https://example.com&sitekey=0x4AAAAAAA&timeout=90&browser=seleniumbase"
 ```
 
-#### Request Parameters:
+#### D) Submit with outbound proxy
 
-| Parameter  | Type    | Description                                                                 | Required |
-|------------|---------|-----------------------------------------------------------------------------|----------|
-| `id`       | string  | The unique task ID returned from the `/turnstile` request.                   | Yes      |
-
-#### Response:
-
-If the CAPTCHA is solved successfully, the server will respond with the following information:
-
-```json
-{
-  "elapsed_time": 7.625,
-  "value": "0.KBtT-r"
-}
+```bash
+curl "http://127.0.0.1:5000/turnstile?url=https://example.com&sitekey=0x4AAAAAAA&proxy=http://user:pass@1.2.3.4:8080"
 ```
+
+#### E) Submit with reverse proxy (host style)
+
+```bash
+curl "http://127.0.0.1:5000/turnstile?url=https://goplay.ml&reverse_proxy=https://as.mykhcdn.workers.dev/"
+```
+
+#### F) Submit with reverse proxy (full style)
+
+```bash
+curl "http://127.0.0.1:5000/turnstile?url=https://goplay.ml&reverse_proxy=https://as.mykhcdn.workers.dev/&reverse_proxy_style=full"
+```
+
+#### G) Submit with `/SCHEMA` marker (forces full style automatically)
+
+```bash
+curl "http://127.0.0.1:5000/turnstile?url=https://goplay.ml&reverse_proxy=https://as.mykhcdn.workers.dev/SCHEMA"
+```
+
+#### H) Poll result
+
+```bash
+curl "http://127.0.0.1:5000/result?id=YOUR_TASK_ID"
+```
+
+Simple bash polling example:
+
+```bash
+TASK_ID="YOUR_TASK_ID"
+while true; do
+  RES=$(curl -s "http://127.0.0.1:5000/result?id=${TASK_ID}")
+  if [ "$RES" = "CAPTCHA_NOT_READY" ]; then
+    sleep 1
+    continue
+  fi
+  echo "$RES"
+  break
+done
+```
+
+Normalized summary:
+
+```bash
+curl "http://127.0.0.1:5000/describe?id=YOUR_TASK_ID"
+```
+
+### Response/result modes
+
+Common `/result` states:
+
+1. **Pending**
+   - raw response can be string: `CAPTCHA_NOT_READY`
+2. **Success token**
+   - `result_mode: token_only`
+3. **Session capture**
+   - `result_mode: session_captured`
+   - may contain cookies/headers even without Turnstile token field
+4. **Failure**
+   - HTTP `422`
+   - `value: CAPTCHA_FAIL`
+   - includes `reason`, `message`, and diagnostics when available
 
 ---
 
-### 🎉 Sponsor
-<a href="https://dashboard.capsolver.com/passport/register?inviteCode=7_Dvkat0RVqc">
-    <img src="https://github.com/user-attachments/assets/176d2a43-2d08-4aa6-bc9d-5e1eb5c3d1a4" alt="Description">
-</a>
+## Mode 2: Command mode (direct solve)
+
+Command mode solves directly in process (no HTTP API).
+
+### Interactive launcher
+
+```bash
+python main.py
+```
+
+You can choose:
+1. Sync solver
+2. Async solver
+3. API server
+
+### Sync example
+
+```python
+from sync_solver import get_turnstile_token
+
+result = get_turnstile_token(
+    url="https://www.crunchbase.com/login",
+    sitekey="0x4AAAAAAAyJK2FfyvayqHnv",
+    action=None,
+    cdata=None,
+    debug=True,
+    headless=False,
+    useragent=None,
+    browser_type="seleniumbase",
+)
+
+print(result)
+```
+
+### Async example
+
+```python
+import asyncio
+from async_solver import get_turnstile_token
+
+async def main():
+    result = await get_turnstile_token(
+        url="https://www.crunchbase.com/login",
+        sitekey="0x4AAAAAAAyJK2FfyvayqHnv",
+        action=None,
+        cdata=None,
+        debug=True,
+        headless=False,
+        useragent=None,
+        browser_type="seleniumbase",
+    )
+    print(result)
+
+asyncio.run(main())
+```
+
+### Command-mode options
+
+These are arguments for `sync_solver.get_turnstile_token()` and `async_solver.get_turnstile_token()`:
+
+| Option | Required | Default | Description |
+|---|---|---|---|
+| `url` | Yes | — | Target page URL. |
+| `sitekey` | Yes | — | Turnstile sitekey for embedded solve flow. |
+| `action` | No | `None` | Optional Turnstile action. |
+| `cdata` | No | `None` | Optional Turnstile cdata. |
+| `debug` | No | `False` | Enable debug logs. |
+| `headless` | No | `False` | Run headless (UA requirement still applies for non-camoufox). |
+| `useragent` | No | `None` | Custom User-Agent. |
+| `browser_type` | No | `seleniumbase` | `chromium`, `chrome`, `msedge`, `camoufox` (if installed), `seleniumbase` (if installed). |
 
 ---
 
-Inspired by [Turnaround](https://github.com/Body-Alhoha/turnaround)
-Original code by [Theyka](https://github.com/Theyka/Turnstile-Solver)
-Changes by [Sexfrance](https://github.com/sexfrance)
+## Proxy and reverse-proxy details
+
+### Outbound proxy formats (`proxy`)
+
+Supported schemes: `http`, `https`, `socks5`, `socks4`
+
+Supported formats:
+
+- `scheme://host:port`
+- `scheme://user:pass@host:port`
+- `scheme:host:port`
+- `scheme:host:port:user:pass`
+- `scheme:user:pass:host:port`
+
+Examples:
+
+- `http://1.2.3.4:8080`
+- `http://user:pass@1.2.3.4:8080`
+- `socks5:1.2.3.4:1080`
+
+> Chromium-family backends (`chromium`, `chrome`, `msedge`, `seleniumbase`) do **not** support authenticated SOCKS proxies. Use unauthenticated SOCKS, HTTP(S) auth proxy, or `camoufox`.
+
+### Reverse-proxy routing
+
+- `reverse_proxy_style=host` (default):
+  - `https://goplay.ml/path` → `https://worker/goplay.ml/path`
+- `reverse_proxy_style=full`:
+  - `https://goplay.ml/path` → `https://worker/https://goplay.ml/path`
+- `reverse_proxy` ending with `/SCHEMA` forces `full` style.
+
+Env controls:
+
+- `ALLOWED_REVERSE_PROXY_HOSTS` (comma-separated whitelist)
+- `REVERSE_PROXY_BYPASS_HOSTS` (default includes `challenges.cloudflare.com`)
+
+---
+
+## Docker + RDP usage
+
+### Compose defaults in this repo
+
+Current `docker-compose.yml` maps:
+
+- API: `5510 -> 5000`
+- RDP: `3333 -> 3389`
+- UC mode: `SELENIUMBASE_UC=true` (explicit in compose)
+- GUI click helper: `SELENIUMBASE_GUI_CLICK=false` (explicit in compose)
+
+So use:
+
+- API base URL: `http://localhost:5510`
+- RDP target: `localhost:3333`
+
+### Build + run
+
+```bash
+docker compose build --no-cache
+docker compose up -d
+docker compose logs -f --tail=200
+```
+
+### Docker runtime environment options
+
+| Env var | Default | Description |
+|---|---|---|
+| `RUN_API_SOLVER` | `true/false` | `true`: run API server. `false`: start XRDP-only container mode. |
+| `ENABLE_RDP_WITH_API` | `false` | Start XRDP services while API mode is running. |
+| `XRDP_PASSWORD` | `root` | Sets root password for RDP login. |
+| `SOLVER_DISPLAY_MODE` | `xvfb` | `xvfb`, `rdp`, or `auto`. `rdp` renders headed browser in XRDP session display. |
+| `RDP_SESSION_WAIT_SECONDS` | `0` | Wait time for XRDP display detection in `rdp` mode. `0` = wait indefinitely. |
+| `SOLVER_BROWSER_TYPE` | `seleniumbase` | Default solver backend for API startup. |
+| `SOLVER_THREAD` | `1` | API worker count (for pooled async backends). |
+| `SOLVER_HEADLESS` | `false` | Adds `--headless` to API command if true. |
+| `SOLVER_DEBUG` | `false` | Adds `--debug` to API command if true. |
+| `SOLVER_USERAGENT` | empty | Adds `--useragent` to API command when set. |
+| `SELENIUMBASE_UC` | `false` (recommended) | UC mode toggle for SeleniumBase driver creation. |
+| `SELENIUMBASE_PREWARM` | `true` | Prewarm SeleniumBase driver at startup. |
+| `SELENIUMBASE_PREFETCH_DRIVER` | `true` | Run `sbase get chromedriver` / `uc_driver` prefetch on startup. |
+| `SELENIUMBASE_GUI_CLICK` | `false` (recommended in Docker) | Enables SeleniumBase GUI click helpers; disabled by default for stability. |
+| `XVFB_SCREEN_WIDTH` | `1920` | Xvfb virtual screen width. |
+| `XVFB_SCREEN_HEIGHT` | `1080` | Xvfb virtual screen height. |
+| `XVFB_SCREEN_DEPTH` | `24` | Xvfb color depth. |
+| `XVFB_DPI` | `96` | Xvfb DPI. |
+| `SOLVER_VIEWPORT_WIDTH` | follows `XVFB_SCREEN_WIDTH` | Browser viewport width. |
+| `SOLVER_VIEWPORT_HEIGHT` | follows `XVFB_SCREEN_HEIGHT` | Browser viewport height. |
+| `SOLVER_DEVICE_SCALE_FACTOR` | `1.0` | Browser DPR / scale factor. |
+| `TURNSTILE_IP_PREFLIGHT_URL` | `https://api64.ipify.org?format=json` | Preflight URL used for IP routing diagnostics in Playwright-backed flows. |
+| `ALLOWED_REVERSE_PROXY_HOSTS` | unset | Optional whitelist for `reverse_proxy` hostnames. |
+| `REVERSE_PROXY_BYPASS_HOSTS` | `challenges.cloudflare.com` | Hosts that stay direct even in reverse-proxy mode. |
+
+---
+
+## Troubleshooting
+
+### 1) `--headless` fails immediately
+For non-camoufox backends, set a User-Agent:
+
+```bash
+python api_solver.py --headless --useragent "Mozilla/5.0 (...)" \
+  --browser_type seleniumbase
+```
+
+### 2) API returns `CAPTCHA_NOT_READY` for a long time
+- Poll `/result` until it changes.
+- Increase `timeout` on `/turnstile`.
+- Try another backend (`browser=playwright` or `browser=chromium`) for comparison.
+
+### 3) SeleniumBase + UC instability in Docker
+- Keep `SELENIUMBASE_GUI_CLICK=false` (recommended).
+- Keep `SELENIUMBASE_PREWARM=true`.
+- If needed, force `SELENIUMBASE_UC=false` for maximum stability.
+
+### 4) Headed browser not visible in RDP
+- Use `SOLVER_DISPLAY_MODE=rdp`.
+- Ensure you are connected to XRDP first (or allow wait with `RDP_SESSION_WAIT_SECONDS=0`).
+- Run non-headless mode.
+
+### 5) Reverse-proxy issues
+- Verify worker path style: `host` vs `full`.
+- Try `/SCHEMA` suffix on `reverse_proxy` if worker expects `https://...` tail.
+- Check `ALLOWED_REVERSE_PROXY_HOSTS` and `REVERSE_PROXY_BYPASS_HOSTS`.
+
+---
+
+## Notes
+
+- API task state is persisted to `results.json`.
+- `GET /describe` is useful for fast classification (`pending`, `ok`, `failure`) without parsing full raw payload.
+- Browser availability depends on installed runtimes and optional packages.
