@@ -127,7 +127,7 @@ class TurnstileAPIServer:
         self.results = self._load_results()
         self.browser_type = browser_type
         self.headless = headless
-        self.close_delay = max(0.0, float(close_delay or 0))
+        self.close_delay = max(0.0, float(close_delay or 6))
         self.useragent = useragent
         self.thread_count = thread
         self.proxy_support = proxy_support
@@ -154,6 +154,104 @@ class TurnstileAPIServer:
         if not url.startswith(("http://", "https://")):
             url = "https://" + url
         return url
+
+    @staticmethod
+    def _parse_cookie_header_pairs(cookie_header: Optional[str]) -> List[Dict[str, str]]:
+        raw = str(cookie_header or "").strip()
+        if not raw:
+            return []
+        pairs: List[Dict[str, str]] = []
+        seen: Set[str] = set()
+        for segment in raw.split(";"):
+            part = segment.strip()
+            if not part or "=" not in part:
+                continue
+            name, value = part.split("=", 1)
+            cookie_name = name.strip()
+            if not cookie_name:
+                continue
+            lowered = cookie_name.lower()
+            if lowered in seen:
+                continue
+            seen.add(lowered)
+            pairs.append({
+                "name": cookie_name,
+                "value": value.strip(),
+            })
+        return pairs
+
+    @staticmethod
+    def _cookie_bootstrap_url_for_target(target_url: str) -> str:
+        normalized = TurnstileAPIServer._normalize_page_url(target_url)
+        parsed = urlparse(normalized)
+        if not parsed.netloc:
+            return ""
+        return urlunparse((parsed.scheme or "https", parsed.netloc, "/", "", "", ""))
+
+    async def _apply_injected_cookies_to_context(
+        self,
+        context,
+        target_url: str,
+        cookie_header: Optional[str],
+    ) -> int:
+        cookies = self._parse_cookie_header_pairs(cookie_header)
+        if not cookies:
+            return 0
+        bootstrap_url = self._cookie_bootstrap_url_for_target(target_url)
+        if not bootstrap_url:
+            return 0
+        payload = [{"name": cookie["name"], "value": cookie["value"], "url": bootstrap_url} for cookie in cookies]
+        await context.add_cookies(payload)
+        return len(payload)
+
+    def _apply_injected_cookies_to_webdriver(
+        self,
+        driver,
+        target_url: str,
+        cookie_header: Optional[str],
+    ) -> int:
+        cookies = self._parse_cookie_header_pairs(cookie_header)
+        if not cookies:
+            return 0
+        bootstrap_url = self._cookie_bootstrap_url_for_target(target_url)
+        if not bootstrap_url:
+            return 0
+        target_host = (urlparse(bootstrap_url).hostname or "").lower()
+        if not target_host:
+            return 0
+
+        self._seleniumbase_ensure_connected(driver, context="inject_cookie_bootstrap")
+        try:
+            driver.get(bootstrap_url)
+        except Exception:
+            if not self._seleniumbase_ensure_connected(driver, context="inject_cookie_bootstrap_get"):
+                return 0
+            try:
+                driver.get(bootstrap_url)
+            except Exception:
+                return 0
+
+        added = 0
+        for cookie in cookies:
+            payload = {
+                "name": cookie["name"],
+                "value": cookie["value"],
+                "domain": target_host,
+                "path": "/",
+            }
+            try:
+                driver.add_cookie(payload)
+                added += 1
+            except Exception:
+                if self._seleniumbase_ensure_connected(driver, context="inject_cookie_add"):
+                    try:
+                        driver.add_cookie(payload)
+                        added += 1
+                        continue
+                    except Exception:
+                        pass
+                continue
+        return added
 
     _REVERSE_PROXY_SCHEMA_MARKER = "/SCHEMA"
 
@@ -474,6 +572,7 @@ class TurnstileAPIServer:
             }
 
         allowed_domains = self._cookie_domains_for_target_host(target_host)
+        candidates: List[Dict[str, Any]] = []
         for morsel in parsed.values():
             name = (morsel.key or "").strip()
             value = morsel.value or ""
@@ -506,8 +605,129 @@ class TurnstileAPIServer:
                         cookie_out["expiry"] = int(dt.timestamp())
                 except Exception:
                     pass
-            return cookie_out
-        return None
+            candidates.append(cookie_out)
+
+        if not candidates:
+            return None
+
+        by_name: Dict[str, Dict[str, Any]] = {}
+        for cookie_out in candidates:
+            lower = str(cookie_out.get("name") or "").strip().lower()
+            if not lower:
+                continue
+            by_name[lower] = cookie_out
+
+        for cookie_out in reversed(candidates):
+            lower = str(cookie_out.get("name") or "").strip().lower()
+            if not lower:
+                continue
+            if by_name.get(lower) is cookie_out and not TurnstileAPIServer._is_deleted_cookie_value(cookie_out.get("value")):
+                return cookie_out
+
+        return by_name.get(str(candidates[-1].get("name") or "").strip().lower()) or candidates[-1]
+
+    @staticmethod
+    def _cookie_identity(cookie: Dict[str, Any]) -> Optional[tuple]:
+        name = str(cookie.get("name") or "").strip()
+        if not name:
+            return None
+        domain = str(cookie.get("domain") or "").strip().lstrip(".").lower()
+        path = str(cookie.get("path") or "/").strip() or "/"
+        return (name, domain, path)
+
+    @staticmethod
+    def _is_deleted_cookie_value(value: Any) -> bool:
+        return str(value or "").strip().lower() == "deleted"
+
+    def _parse_set_cookie_headers_to_cookies(
+        self,
+        set_cookie_headers: List[str],
+        target_hosts: Set[str],
+    ) -> List[Dict[str, Any]]:
+        if not set_cookie_headers:
+            return []
+
+        hosts = [h.strip().lstrip(".").lower() for h in (target_hosts or set()) if h]
+        parsed: List[Dict[str, Any]] = []
+        index: Dict[tuple, int] = {}
+
+        for raw_cookie in set_cookie_headers:
+            raw = (raw_cookie or "").strip()
+            if not raw:
+                continue
+
+            parsed_cookie: Optional[Dict[str, Any]] = None
+            if hosts:
+                for host in hosts:
+                    parsed_cookie = self._parse_set_cookie_to_webdriver_cookie(raw, host)
+                    if parsed_cookie:
+                        break
+            else:
+                parsed_cookie = self._parse_set_cookie_to_webdriver_cookie(raw, "")
+
+            if not parsed_cookie:
+                continue
+
+            identity = self._cookie_identity(parsed_cookie)
+            if identity and identity in index:
+                parsed[index[identity]] = parsed_cookie
+                continue
+            if identity:
+                index[identity] = len(parsed)
+            parsed.append(parsed_cookie)
+
+        return parsed
+
+    def _merge_cookies_with_set_cookie_headers(
+        self,
+        cookies: List[Dict[str, Any]],
+        set_cookie_headers: List[str],
+        target_hosts: Set[str],
+    ) -> List[Dict[str, Any]]:
+        base_cookies = [dict(cookie) for cookie in (cookies or [])]
+        if not set_cookie_headers:
+            return base_cookies
+
+        extra = self._parse_set_cookie_headers_to_cookies(set_cookie_headers, target_hosts)
+        if not extra:
+            return base_cookies
+
+        # Drop seed cookies for any names that were actually refreshed by Set-Cookie.
+        refreshed_names = {
+            str(cookie.get("name") or "").strip().lower()
+            for cookie in extra
+            if str(cookie.get("name") or "").strip()
+        }
+        merged: List[Dict[str, Any]] = [
+            dict(cookie)
+            for cookie in base_cookies
+            if str(cookie.get("name") or "").strip().lower() not in refreshed_names
+        ]
+
+        index: Dict[tuple, int] = {}
+        for i, cookie in enumerate(merged):
+            identity = self._cookie_identity(cookie)
+            if identity:
+                index[identity] = i
+
+        for cookie in extra:
+            identity = self._cookie_identity(cookie)
+            if not identity:
+                continue
+            existing = index.get(identity)
+            candidate_deleted = self._is_deleted_cookie_value(cookie.get("value"))
+            if existing is None:
+                if candidate_deleted:
+                    continue
+                index[identity] = len(merged)
+                merged.append(cookie)
+            else:
+                current = merged[existing]
+                if candidate_deleted and not self._is_deleted_cookie_value(current.get("value")):
+                    continue
+                merged[existing] = {**merged[existing], **cookie}
+
+        return merged
 
     def _apply_reverse_proxy_cookies_to_target(
         self,
@@ -932,7 +1152,7 @@ class TurnstileAPIServer:
         return browser_types
 
     def _normalize_browser_type(self, browser_type: Optional[str]) -> str:
-        value = (browser_type or self.browser_type or "seleniumbase").strip().lower()
+        value = (browser_type or self.browser_type or "chromium").strip().lower()
         if value == "playwrite":
             value = "playwright"
         if value in ("selenium", "sb"):
@@ -1090,12 +1310,233 @@ class TurnstileAPIServer:
     def _format_cookie_header(cookies: List[Dict[str, Any]]) -> str:
         if not cookies:
             return ""
-        return "; ".join(f"{c['name']}={c['value']}" for c in cookies if c.get("name"))
+        merged_by_name: Dict[str, Dict[str, Any]] = {}
+        order: List[str] = []
+        for cookie in (cookies or []):
+            name = str(cookie.get("name") or "").strip()
+            if not name:
+                continue
+            lower = name.lower()
+            value = str(cookie.get("value") or "")
+            existing = merged_by_name.get(lower)
+            if existing is None:
+                merged_by_name[lower] = {"name": name, "value": value}
+                order.append(lower)
+                continue
+            existing_deleted = TurnstileAPIServer._is_deleted_cookie_value(existing.get("value"))
+            incoming_deleted = TurnstileAPIServer._is_deleted_cookie_value(value)
+            if existing_deleted and not incoming_deleted:
+                merged_by_name[lower] = {"name": name, "value": value}
+                continue
+            if not existing_deleted and incoming_deleted:
+                continue
+            merged_by_name[lower] = {"name": name, "value": value}
+        return "; ".join(
+            f"{merged_by_name[key]['name']}={merged_by_name[key]['value']}"
+            for key in order
+            if key in merged_by_name
+        )
 
     @staticmethod
-    def _has_d_and_locl(cookies: List[Dict[str, Any]]) -> bool:
-        names = {c.get("name") for c in cookies}
-        return "d" in names and "locl" in names
+    def _format_cookie_header_excluding_injected_d(cookies: List[Dict[str, Any]], injected_cookie_header: Optional[str] = None) -> str:
+        if not injected_cookie_header:
+            return TurnstileAPIServer._format_cookie_header(cookies)
+        injected_map: Dict[str, str] = {}
+        for cookie in TurnstileAPIServer._parse_cookie_header_pairs(injected_cookie_header):
+            injected_map[str(cookie.get("name") or "").strip().lower()] = str(cookie.get("value") or "").strip()
+        filtered: List[Dict[str, Any]] = []
+        for cookie in (cookies or []):
+            name = str(cookie.get("name") or "").strip().lower()
+            value = str(cookie.get("value") or "").strip()
+            if name == "d" and injected_map.get("d") == value:
+                continue
+            filtered.append(cookie)
+        return TurnstileAPIServer._format_cookie_header(filtered)
+
+    @staticmethod
+    def _select_last_response_d_value(set_cookie_headers: List[str]) -> Optional[str]:
+        selected = None
+        for raw in (set_cookie_headers or []):
+            parsed = SimpleCookie()
+            try:
+                parsed.load(str(raw or '').strip())
+            except Exception:
+                continue
+            for morsel in parsed.values():
+                name = str(morsel.key or '').strip().lower()
+                if name != 'd':
+                    continue
+                value = str(morsel.value or '').strip()
+                if not value or TurnstileAPIServer._is_deleted_cookie_value(value):
+                    continue
+                selected = value
+        return selected
+
+    @staticmethod
+    def _normalize_cookie_store(cookies: List[Dict[str, Any]], injected_cookie_header: Optional[str] = None) -> List[Dict[str, Any]]:
+        normalized: List[Dict[str, Any]] = []
+        by_name: Dict[str, int] = {}
+        for cookie in (cookies or []):
+            name = str(cookie.get("name") or "").strip()
+            if not name:
+                continue
+            lower = name.lower()
+            value = str(cookie.get("value") or "")
+            existing_index = by_name.get(lower)
+            if existing_index is None:
+                if TurnstileAPIServer._is_deleted_cookie_value(value):
+                    continue
+                by_name[lower] = len(normalized)
+                normalized.append(dict(cookie))
+                continue
+
+            current = normalized[existing_index]
+            current_deleted = TurnstileAPIServer._is_deleted_cookie_value(current.get("value"))
+            incoming_deleted = TurnstileAPIServer._is_deleted_cookie_value(value)
+            if incoming_deleted and not current_deleted:
+                continue
+            normalized[existing_index] = dict(cookie)
+
+        return normalized
+
+    @staticmethod
+    def _replace_cookie_value_by_name(
+        cookies: List[Dict[str, Any]],
+        name: str,
+        value: str,
+    ) -> List[Dict[str, Any]]:
+        target_name = str(name or "").strip().lower()
+        if not target_name:
+            return [dict(cookie) for cookie in (cookies or [])]
+        updated: List[Dict[str, Any]] = []
+        template: Optional[Dict[str, Any]] = None
+        for cookie in (cookies or []):
+            lower = str(cookie.get("name") or "").strip().lower()
+            if lower != target_name:
+                updated.append(dict(cookie))
+                continue
+            if template is None:
+                template = dict(cookie)
+        if template is None:
+            template = {"name": name, "domain": "", "path": "/"}
+        template = dict(template)
+        template["name"] = name
+        template["value"] = value
+        updated.append(template)
+        return updated
+
+    @staticmethod
+    def _merge_cookie_stores(
+        base_cookies: List[Dict[str, Any]],
+        overlay_cookies: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        merged: List[Dict[str, Any]] = [dict(cookie) for cookie in (base_cookies or [])]
+        index: Dict[tuple, int] = {}
+        for i, cookie in enumerate(merged):
+            identity = TurnstileAPIServer._cookie_identity(cookie)
+            if identity:
+                index[identity] = i
+
+        for cookie in (overlay_cookies or []):
+            identity = TurnstileAPIServer._cookie_identity(cookie)
+            if not identity:
+                continue
+            existing = index.get(identity)
+            candidate_deleted = TurnstileAPIServer._is_deleted_cookie_value(cookie.get("value"))
+            if existing is None:
+                if candidate_deleted:
+                    continue
+                index[identity] = len(merged)
+                merged.append(dict(cookie))
+            else:
+                current = merged[existing]
+                if candidate_deleted and not TurnstileAPIServer._is_deleted_cookie_value(current.get("value")):
+                    continue
+                merged[existing] = {**current, **cookie}
+
+        return merged
+
+    @staticmethod
+    def _overlay_injected_non_d_cookies(
+        cookies: List[Dict[str, Any]],
+        injected_cookie_header: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        if not injected_cookie_header:
+            return [dict(cookie) for cookie in (cookies or [])]
+        merged: List[Dict[str, Any]] = [dict(cookie) for cookie in (cookies or [])]
+        for injected in TurnstileAPIServer._parse_cookie_header_pairs(injected_cookie_header):
+            name = str(injected.get("name") or "").strip()
+            value = str(injected.get("value") or "").strip()
+            if not name:
+                continue
+            lower = name.lower()
+            if lower == "d":
+                continue
+            replaced = False
+            for cookie in merged:
+                if str(cookie.get("name") or "").strip().lower() != lower:
+                    continue
+                cookie["name"] = name
+                cookie["value"] = value
+                replaced = True
+            if not replaced:
+                merged.append({"name": name, "value": value})
+        return merged
+
+    @staticmethod
+    def _cookie_value_map(
+        cookies: List[Dict[str, Any]],
+        injected_cookie_header: Optional[str] = None,
+    ) -> Dict[str, str]:
+        cookie_map: Dict[str, str] = {}
+        for cookie in TurnstileAPIServer._normalize_cookie_store(cookies or []):
+            name = str(cookie.get("name") or "").strip().lower()
+            if not name:
+                continue
+            value = str(cookie.get("value") or "").strip()
+            cookie_map[name] = value
+        return cookie_map
+
+    @staticmethod
+    def _has_d_and_locl(cookies: List[Dict[str, Any]], injected_cookie_header: Optional[str] = None) -> bool:
+        cookie_map = TurnstileAPIServer._cookie_value_map(cookies, injected_cookie_header)
+        d_value = cookie_map.get("d", "")
+        locl_value = cookie_map.get("locl", "")
+        if not d_value or not locl_value:
+            return False
+        if TurnstileAPIServer._is_deleted_cookie_value(d_value):
+            return False
+        if TurnstileAPIServer._is_deleted_cookie_value(locl_value):
+            return False
+        if injected_cookie_header:
+            injected_map: Dict[str, str] = {}
+            for cookie in TurnstileAPIServer._parse_cookie_header_pairs(injected_cookie_header):
+                injected_map[str(cookie.get("name") or "").strip().lower()] = str(cookie.get("value") or "").strip()
+            injected_d = injected_map.get("d", "")
+            if injected_d and injected_d == d_value:
+                return False
+        return True
+
+    @staticmethod
+    def _has_new_d_after_injected(cookies: List[Dict[str, Any]], injected_cookie_header: Optional[str] = None) -> bool:
+        if not injected_cookie_header:
+            return TurnstileAPIServer._has_d_and_locl(cookies)
+        injected_map: Dict[str, str] = {}
+        for cookie in TurnstileAPIServer._parse_cookie_header_pairs(injected_cookie_header):
+            injected_map[str(cookie.get("name") or "").strip().lower()] = str(cookie.get("value") or "").strip()
+        cookie_map = TurnstileAPIServer._cookie_value_map(cookies, None)
+        d_value = cookie_map.get("d", "")
+        locl_value = cookie_map.get("locl", "")
+        if not d_value or not locl_value:
+            return False
+        if TurnstileAPIServer._is_deleted_cookie_value(d_value):
+            return False
+        if TurnstileAPIServer._is_deleted_cookie_value(locl_value):
+            return False
+        injected_d = injected_map.get("d", "")
+        if injected_d and d_value == injected_d:
+            return False
+        return True
 
     @staticmethod
     def _has_cf_clearance(cookies: List[Dict[str, Any]]) -> bool:
@@ -1109,8 +1550,42 @@ class TurnstileAPIServer:
             return True
         if raw in {"0", "false", "no", "off"}:
             return False
-        # Default relaxed mode: accept cf_clearance-only sessions as usable.
-        return False
+        # Default strict mode: keep solving until d+locl are captured.
+        return True
+
+    @staticmethod
+    def _cf_clearance_grace_seconds() -> float:
+        """
+        Wait window before accepting cf_clearance-only sessions.
+        Allows downstream Set-Cookie (d/locl/etc.) to arrive after challenge flow.
+        """
+        raw = (os.environ.get("TURNSTILE_CF_CLEARANCE_GRACE_SECONDS") or "").strip()
+        if not raw:
+            return 10.0
+        try:
+            value = float(raw)
+        except Exception:
+            return 10.0
+        if value < 0:
+            return 0.0
+        if value > 120:
+            return 120.0
+        return value
+
+    @staticmethod
+    def _turnstile_token_post_wait_seconds() -> float:
+        raw = (os.environ.get("TURNSTILE_TOKEN_POST_WAIT_SECONDS") or "").strip()
+        if not raw:
+            return 15.0
+        try:
+            value = float(raw)
+        except Exception:
+            return 15.0
+        if value < 0:
+            return 0.0
+        if value > 120:
+            return 120.0
+        return value
 
     def _has_usable_session_cookies(self, cookies: List[Dict[str, Any]]) -> bool:
         if self._has_d_and_locl(cookies):
@@ -1121,7 +1596,15 @@ class TurnstileAPIServer:
 
     @staticmethod
     def _d_locl_cookie_header(cookies: List[Dict[str, Any]]) -> str:
-        by = {c.get("name"): c.get("value", "") for c in cookies if c.get("name") in ("d", "locl")}
+        by: Dict[str, str] = {}
+        for cookie in (cookies or []):
+            name = str(cookie.get("name") or "").strip()
+            if name not in ("d", "locl"):
+                continue
+            value = str(cookie.get("value") or "").strip()
+            if not value or TurnstileAPIServer._is_deleted_cookie_value(value):
+                continue
+            by[name] = value
         parts = []
         if "d" in by:
             parts.append(f"d={by['d']}")
@@ -1166,6 +1649,107 @@ class TurnstileAPIServer:
             return v or ""
         except Exception:
             return ""
+
+    @staticmethod
+    async def _playwright_submit_turnstile_form(page, token: str) -> Dict[str, Any]:
+        script = """(token) => {
+            const t = token || "";
+            let input = document.querySelector('[name="cf-turnstile-response"]');
+            if (input) {
+                try { input.value = t; } catch (e) {}
+            } else if (t) {
+                input = document.createElement("input");
+                input.type = "hidden";
+                input.name = "cf-turnstile-response";
+                input.value = t;
+            }
+            let form = input ? input.closest("form") : null;
+            if (!form) {
+                form = document.querySelector("form");
+                if (form && input && !input.closest("form")) {
+                    try { form.appendChild(input); } catch (e) {}
+                }
+            }
+            if (!form) {
+                return { submitted: false, reason: "no_form" };
+            }
+            let prevented = false;
+            try {
+                const ev = new Event("submit", { bubbles: true, cancelable: true });
+                form.dispatchEvent(ev);
+                prevented = !!ev.defaultPrevented;
+            } catch (e) {}
+            try {
+                if (!prevented) {
+                    if (typeof form.requestSubmit === "function") form.requestSubmit();
+                    else form.submit();
+                }
+                return {
+                    submitted: true,
+                    prevented,
+                    action: form.action || location.href,
+                    method: (form.method || "GET").toUpperCase(),
+                };
+            } catch (e) {
+                return { submitted: false, prevented, reason: String(e || "") };
+            }
+        }"""
+        try:
+            result = await page.evaluate(script, token or "")
+            if isinstance(result, dict):
+                return result
+            return {"submitted": bool(result)}
+        except Exception as e:
+            return {"submitted": False, "reason": TurnstileAPIServer._trim_text(e, 240)}
+
+    def _seleniumbase_submit_turnstile_form(self, driver, token: str) -> Dict[str, Any]:
+        script = """
+            const t = arguments[0] || "";
+            let input = document.querySelector('[name="cf-turnstile-response"]');
+            if (input) {
+                try { input.value = t; } catch (e) {}
+            } else if (t) {
+                input = document.createElement("input");
+                input.type = "hidden";
+                input.name = "cf-turnstile-response";
+                input.value = t;
+            }
+            let form = input ? input.closest("form") : null;
+            if (!form) {
+                form = document.querySelector("form");
+                if (form && input && !input.closest("form")) {
+                    try { form.appendChild(input); } catch (e) {}
+                }
+            }
+            if (!form) {
+                return { submitted: false, reason: "no_form" };
+            }
+            let prevented = false;
+            try {
+                const ev = new Event("submit", { bubbles: true, cancelable: true });
+                form.dispatchEvent(ev);
+                prevented = !!ev.defaultPrevented;
+            } catch (e) {}
+            try {
+                if (!prevented) {
+                    if (typeof form.requestSubmit === "function") form.requestSubmit();
+                    else form.submit();
+                }
+                return {
+                    submitted: true,
+                    prevented: prevented,
+                    action: form.action || location.href,
+                    method: (form.method || "GET").toUpperCase()
+                };
+            } catch (e) {
+                return { submitted: false, prevented: prevented, reason: String(e || "") };
+            }
+        """
+        try:
+            result = driver.execute_script(script, token or "")
+            return result if isinstance(result, dict) else {"submitted": bool(result)}
+        except Exception as e:
+            return {"submitted": False, "reason": self._trim_text(e, 240)}
 
     @staticmethod
     def _trim_text(value: Any, limit: int = 240) -> str:
@@ -1525,6 +2109,69 @@ class TurnstileAPIServer:
             "url_final": result.get("url_final"),
         }
 
+    @staticmethod
+    def _result_cookie_names(result: Dict[str, Any]) -> Set[str]:
+        names: Set[str] = set()
+        for cookie in (result.get("cookies") or []):
+            name = str(cookie.get("name") or "").strip()
+            if name:
+                names.add(name)
+        for name in (result.get("cookie_names") or []):
+            cleaned = str(name or "").strip()
+            if cleaned:
+                names.add(cleaned)
+        return names
+
+    @classmethod
+    def _result_has_d_locl(cls, result: Dict[str, Any]) -> bool:
+        cookies = result.get("cookies") or []
+        if isinstance(cookies, list):
+            return cls._has_d_and_locl(cookies)
+        names = cls._result_cookie_names(result)
+        return "d" in names and "locl" in names
+
+    @classmethod
+    def _result_quality_score(cls, result: Dict[str, Any]) -> int:
+        if not isinstance(result, dict):
+            return -999
+        score = 0
+        if result.get("value") != "CAPTCHA_FAIL":
+            score += 10
+        names = cls._result_cookie_names(result)
+        if "cf_clearance" in names:
+            score += 20
+        if "d" in names:
+            score += 40
+        if "locl" in names:
+            score += 40
+        score += min(len(result.get("set_cookie_headers") or []), 20)
+        return score
+
+    def _selenium_fallback_browser(self) -> Optional[str]:
+        raw = (os.environ.get("TURNSTILE_SELENIUM_FALLBACK_BROWSER") or "").strip().lower()
+        if not raw:
+            raw = "chromium"
+        if raw in {"0", "false", "off", "none", "no"}:
+            return None
+        try:
+            normalized = self._normalize_browser_type(raw)
+        except ValueError:
+            return None
+        if normalized == "seleniumbase":
+            return None
+        return normalized
+
+    @classmethod
+    def _should_retry_after_selenium(cls, result: Dict[str, Any]) -> bool:
+        if not isinstance(result, dict):
+            return True
+        if cls._result_has_d_locl(result):
+            return False
+        if result.get("value") == "CAPTCHA_FAIL":
+            return True
+        mode = str(result.get("result_mode") or "").strip().lower()
+        return mode in {"session_captured", "token_only", "failure", ""}
+
     def _setup_routes(self) -> None:
         """Set up the application routes."""
         self.app.before_serving(self._startup)
@@ -1745,6 +2392,7 @@ class TurnstileAPIServer:
         solve_timeout: Optional[float] = None,
         reverse_proxy_base: Optional[str] = None,
         reverse_proxy_style: str = "host",
+        injected_cookie_header: Optional[str] = None,
     ) -> Dict[str, Any]:
         start_time = time.time()
         driver = None
@@ -1754,6 +2402,8 @@ class TurnstileAPIServer:
             url_with_slash = self._normalize_page_url(url)
             if not url_with_slash.endswith("/"):
                 url_with_slash += "/"
+            if injected_cookie_header:
+                self._apply_injected_cookies_to_webdriver(driver, url_with_slash, injected_cookie_header)
 
             self._seleniumbase_open_url(driver, url_with_slash, proxy_cfg)
             turnstile_div = (
@@ -1861,6 +2511,7 @@ class TurnstileAPIServer:
         solve_timeout: Optional[float] = None,
         reverse_proxy_base: Optional[str] = None,
         reverse_proxy_style: str = "host",
+        injected_cookie_header: Optional[str] = None,
     ) -> Dict[str, Any]:
         start_time = time.time()
         driver = None
@@ -1871,9 +2522,24 @@ class TurnstileAPIServer:
         proxied_doc_set_cookie_headers: List[str] = []
         proxied_doc_status: Optional[int] = None
         proxied_doc_error: str = ""
+        injected_cookie_names = [cookie["name"] for cookie in self._parse_cookie_header_pairs(injected_cookie_header)]
+        injected_cookie_add_count = 0
         try:
             driver = self._create_seleniumbase_driver(proxy_cfg)
             page_url = self._normalize_page_url(url)
+            if injected_cookie_names:
+                injected_cookie_add_count = self._apply_injected_cookies_to_webdriver(
+                    driver,
+                    page_url,
+                    injected_cookie_header,
+                )
+                if self.debug:
+                    logger.info(
+                        "Browser SB: injected %s/%s request cookies for %s",
+                        injected_cookie_add_count,
+                        len(injected_cookie_names),
+                        page_url,
+                    )
             nav_url = page_url
             if rev_base:
                 nav_url = self._build_reverse_proxied_url(page_url, rev_base, rev_style)
@@ -1900,8 +2566,18 @@ class TurnstileAPIServer:
             token_value = ""
             session_via_dl = False
             proxy_cookie_added = 0
+            cf_clearance_seen_at: Optional[float] = None
+            cf_clearance_grace = self._cf_clearance_grace_seconds()
+            require_d_locl_only = self._require_d_and_locl_only()
+            token_seen_at: Optional[float] = None
+            token_post_wait = self._turnstile_token_post_wait_seconds()
+            token_form_submit_attempted = False
+            token_form_submit_result: Dict[str, Any] = {}
+            max_poll_attempts = 200
+            if solve_timeout is not None:
+                max_poll_attempts = max(200, int((solve_timeout / 0.35) + 40))
 
-            for attempt in range(200):
+            for attempt in range(max_poll_attempts):
                 if solve_timeout is not None and (time.time() - start_time) > solve_timeout:
                     return self._failure_payload_for_seleniumbase(
                         elapsed_time=round(time.time() - start_time, 3),
@@ -1920,6 +2596,12 @@ class TurnstileAPIServer:
                             "reverse_proxy_bootstrap_error": proxied_doc_error,
                             "set_cookie_headers": proxied_doc_set_cookie_headers[:20],
                             "ip_preflight": self._seleniumbase_ip_preflight_placeholder(rev_base, rev_style),
+                            "cf_clearance_grace_seconds": cf_clearance_grace,
+                            "require_d_locl_only": require_d_locl_only,
+                            "token_post_wait_seconds": token_post_wait,
+                            "token_form_submit_result": token_form_submit_result,
+                            "injected_cookie_names": injected_cookie_names,
+                            "injected_cookie_add_count": injected_cookie_add_count,
                         },
                     )
                 try:
@@ -1933,13 +2615,46 @@ class TurnstileAPIServer:
                     context=f"poll_loop_attempt_{attempt}",
                 )
 
-                if self._has_usable_session_cookies(cookies):
+                has_d_locl = self._has_new_d_after_injected(cookies, injected_cookie_header)
+                has_cf_clearance = self._has_cf_clearance(cookies)
+                if has_d_locl:
                     session_via_dl = True
                     break
+                if has_cf_clearance and not require_d_locl_only:
+                    now = time.time()
+                    if cf_clearance_seen_at is None:
+                        cf_clearance_seen_at = now
+                        if self.debug:
+                            logger.debug(
+                                "Browser SB: cf_clearance detected (attempt %s), waiting %.1fs for d/locl",
+                                attempt,
+                                cf_clearance_grace,
+                            )
+                    elif (now - cf_clearance_seen_at) >= cf_clearance_grace:
+                        session_via_dl = True
+                        break
 
                 token_value = self._seleniumbase_read_turnstile_token(driver)
                 if token_value:
-                    break
+                    now = time.time()
+                    if token_seen_at is None:
+                        token_seen_at = now
+                    if not token_form_submit_attempted:
+                        token_form_submit_attempted = True
+                        token_form_submit_result = self._seleniumbase_submit_turnstile_form(driver, token_value)
+                        if self.debug:
+                            logger.debug(
+                                "Browser SB: token detected (attempt %s); form submit probe=%s",
+                                attempt,
+                                token_form_submit_result,
+                            )
+                        time.sleep(0.8)
+                        continue
+                    if self._has_new_d_after_injected(cookies, injected_cookie_header):
+                        session_via_dl = True
+                        break
+                    if (now - token_seen_at) >= token_post_wait:
+                        break
 
                 if attempt % 4 == 0:
                     self._seleniumbase_click_turnstile(driver)
@@ -1973,7 +2688,7 @@ class TurnstileAPIServer:
                     if self._has_usable_session_cookies(cookies):
                         session_via_dl = True
 
-            cookie_header = self._format_cookie_header(cookies)
+            cookie_header = self._format_cookie_header_excluding_injected_d(cookies, injected_cookie_header)
             elapsed_time = round(time.time() - start_time, 3)
 
             if not token_value and not session_via_dl:
@@ -1997,6 +2712,12 @@ class TurnstileAPIServer:
                         "reverse_proxy_bootstrap_error": proxied_doc_error,
                         "set_cookie_headers": proxied_doc_set_cookie_headers[:20],
                         "ip_preflight": self._seleniumbase_ip_preflight_placeholder(rev_base, rev_style),
+                        "cf_clearance_grace_seconds": cf_clearance_grace,
+                        "require_d_locl_only": require_d_locl_only,
+                        "token_post_wait_seconds": token_post_wait,
+                        "token_form_submit_result": token_form_submit_result,
+                        "injected_cookie_names": injected_cookie_names,
+                        "injected_cookie_add_count": injected_cookie_add_count,
                     },
                 )
 
@@ -2037,6 +2758,12 @@ class TurnstileAPIServer:
                 "reverse_proxy_cookie_add_count": proxy_cookie_added,
                 "reverse_proxy_bootstrap_error": proxied_doc_error,
                 "ip_preflight": self._seleniumbase_ip_preflight_placeholder(rev_base, rev_style),
+                "cf_clearance_grace_seconds": cf_clearance_grace,
+                "require_d_locl_only": require_d_locl_only,
+                "token_post_wait_seconds": token_post_wait,
+                "token_form_submit_result": token_form_submit_result,
+                "injected_cookie_names": injected_cookie_names,
+                "injected_cookie_add_count": injected_cookie_add_count,
             }
             if session_via_dl and not token_value:
                 payload["turnstile_token"] = None
@@ -2046,9 +2773,14 @@ class TurnstileAPIServer:
                         "(worker Set-Cookie applied onto target domain when needed)."
                     )
                 else:
-                    payload["note"] = (
-                        "Usable session cookies were detected in the jar; headers captured immediately."
-                    )
+                    if self._has_new_d_after_injected(cookies, injected_cookie_header):
+                        payload["note"] = (
+                            "Session cookies `d` and `locl` were detected in the jar; headers captured immediately."
+                        )
+                    else:
+                        payload["note"] = (
+                            "cf_clearance was captured and no d/locl arrived before the current stop condition."
+                        )
             return payload
         except Exception as e:
             elapsed_time = round(time.time() - start_time, 3)
@@ -2070,6 +2802,12 @@ class TurnstileAPIServer:
                     "reverse_proxy_bootstrap_error": proxied_doc_error,
                     "set_cookie_headers": proxied_doc_set_cookie_headers[:20],
                     "ip_preflight": self._seleniumbase_ip_preflight_placeholder(rev_base, rev_style),
+                    "cf_clearance_grace_seconds": cf_clearance_grace,
+                    "require_d_locl_only": require_d_locl_only,
+                    "token_post_wait_seconds": token_post_wait,
+                    "token_form_submit_result": token_form_submit_result,
+                    "injected_cookie_names": injected_cookie_names,
+                    "injected_cookie_add_count": injected_cookie_add_count,
                 },
             )
         finally:
@@ -2091,6 +2829,7 @@ class TurnstileAPIServer:
         proxy_cfg_override: Optional[Dict[str, str]] = None,
         reverse_proxy_base: Optional[str] = None,
         reverse_proxy_style: str = "host",
+        injected_cookie_header: Optional[str] = None,
     ) -> None:
         """Serve local HTML with an embedded Turnstile widget (legacy flow when ``sitekey`` is provided)."""
         effective_browser_type = self._normalize_browser_type(browser_type_override)
@@ -2128,6 +2867,7 @@ class TurnstileAPIServer:
                     solve_timeout,
                     reverse_proxy_base,
                     reverse_proxy_style,
+                    injected_cookie_header,
                 )
                 if not isinstance(payload, dict):
                     raise RuntimeError("SeleniumBase embedded solve returned an invalid payload.")
@@ -2196,9 +2936,11 @@ class TurnstileAPIServer:
         async def _run_embedded() -> None:
             nonlocal context
             context = await browser.new_context(**self._browser_context_options(proxy_cfg))
-            page = await context.new_page()
             base = self._normalize_page_url(url)
             url_with_slash = base + "/" if not base.endswith("/") else base
+            if injected_cookie_header:
+                await self._apply_injected_cookies_to_context(context, url_with_slash, injected_cookie_header)
+            page = await context.new_page()
             turnstile_div = (
                 '<div class="cf-turnstile" style="background: white;" data-sitekey="' + sitekey + '"'
                 + (f' data-action="{action}"' if action else "")
@@ -2339,6 +3081,7 @@ class TurnstileAPIServer:
         proxy_cfg_override: Optional[Dict[str, str]] = None,
         reverse_proxy_base: Optional[str] = None,
         reverse_proxy_style: str = "host",
+        injected_cookie_header: Optional[str] = None,
     ):
         """Load the real page, pass Turnstile like a normal browser, then return token + cookies."""
         if sitekey:
@@ -2353,6 +3096,7 @@ class TurnstileAPIServer:
                 proxy_cfg_override,
                 reverse_proxy_base,
                 reverse_proxy_style,
+                injected_cookie_header,
             )
             return
 
@@ -2380,17 +3124,62 @@ class TurnstileAPIServer:
                 return
 
             try:
+                fallback_browser = self._selenium_fallback_browser()
+                selenium_timeout = solve_timeout
+                if fallback_browser and solve_timeout is not None:
+                    selenium_timeout = min(solve_timeout, max(30.0, solve_timeout * 0.4))
                 payload = await asyncio.to_thread(
                     self._solve_turnstile_seleniumbase_sync,
                     url,
                     proxy_cfg,
                     effective_browser_type,
-                    solve_timeout,
+                    selenium_timeout,
                     reverse_proxy_base,
                     reverse_proxy_style,
+                    injected_cookie_header,
                 )
                 if not isinstance(payload, dict):
                     raise RuntimeError("SeleniumBase solve returned an invalid payload.")
+
+                if fallback_browser and self._should_retry_after_selenium(payload):
+                    if self.debug:
+                        logger.debug(
+                            "SeleniumBase result incomplete (score=%s, reason=%s); retrying with fallback browser=%s",
+                            self._result_quality_score(payload),
+                            payload.get("reason"),
+                            fallback_browser,
+                        )
+                    original_payload = payload
+                    await self._solve_turnstile(
+                        task_id,
+                        url,
+                        sitekey,
+                        action,
+                        cdata,
+                        solve_timeout,
+                        fallback_browser,
+                        proxy_cfg_override,
+                        reverse_proxy_base,
+                        reverse_proxy_style,
+                        injected_cookie_header,
+                    )
+                    fallback_payload = self.results.get(task_id)
+                    if (
+                        isinstance(fallback_payload, dict)
+                        and self._result_quality_score(fallback_payload) >= self._result_quality_score(original_payload)
+                    ):
+                        if self.debug:
+                            logger.debug(
+                                "Fallback browser result kept (score=%s >= %s)",
+                                self._result_quality_score(fallback_payload),
+                                self._result_quality_score(original_payload),
+                            )
+                        return
+                    self.results[task_id] = original_payload
+                    self._save_results()
+                    if original_payload.get("value") == "CAPTCHA_FAIL":
+                        self._log_failure_payload(0, task_id, original_payload)
+                    return
 
                 self.results[task_id] = payload
                 self._save_results()
@@ -2455,6 +3244,23 @@ class TurnstileAPIServer:
         async def _run_solve():
             nonlocal context
             context = await browser.new_context(**self._browser_context_options(proxy_cfg))
+            page_url = self._normalize_page_url(url)
+            injected_cookie_names = [cookie["name"] for cookie in self._parse_cookie_header_pairs(injected_cookie_header)]
+            injected_cookie_add_count = 0
+            if injected_cookie_names:
+                injected_cookie_add_count = await self._apply_injected_cookies_to_context(
+                    context,
+                    page_url,
+                    injected_cookie_header,
+                )
+                if self.debug:
+                    logger.info(
+                        "Browser %s: injected %s/%s request cookies for %s",
+                        index,
+                        injected_cookie_add_count,
+                        len(injected_cookie_names),
+                        page_url,
+                    )
             page = await context.new_page()
             if rev_base:
 
@@ -2463,7 +3269,7 @@ class TurnstileAPIServer:
 
                 await page.route("**/*", _rp_route)
             ip_preflight = await self._run_ip_preflight(page, index, rev_base, rev_style)
-            set_cookie_headers: List[str] = []
+            response_capture_tasks: Set[asyncio.Task] = set()
             last_document_request_headers: Dict[str, str] = {}
             last_document_response_headers: Dict[str, str] = {}
             last_document_request_body: List[Optional[str]] = [None]
@@ -2471,6 +3277,9 @@ class TurnstileAPIServer:
             last_document_status_text: List[str] = [""]
             last_document_url: List[str] = [""]
             last_document_failure_text: List[str] = [""]
+            last_document_set_cookie_headers: List[str] = []
+            last_document_response_cookies: List[Dict[str, Any]] = []
+            last_document_response_d_value: List[Optional[str]] = [None]
             turnstile_capture: Dict[str, Any] = {
                 "requests": [],
                 "responses": [],
@@ -2499,6 +3308,98 @@ class TurnstileAPIServer:
                 if len(target_list) < limit:
                     target_list.append(item)
 
+            async def _capture_response_set_cookies(response, headers: Dict[str, str]) -> None:
+                try:
+                    set_cookie_headers: List[str] = []
+                    try:
+                        header_values = await response.header_values("set-cookie")
+                        if header_values:
+                            set_cookie_headers.extend([str(v or "").strip() for v in header_values if str(v or "").strip()])
+                    except Exception:
+                        pass
+                    if not set_cookie_headers:
+                        try:
+                            for pair in (await response.headers_array()) or []:
+                                if isinstance(pair, dict):
+                                    name = pair.get("name")
+                                    value = pair.get("value")
+                                else:
+                                    name = getattr(pair, "name", None)
+                                    value = getattr(pair, "value", None)
+                                if str(name or "").lower() != "set-cookie":
+                                    continue
+                                raw = str(value or "").strip()
+                                if raw:
+                                    set_cookie_headers.append(raw)
+                        except Exception:
+                            pass
+                    if not set_cookie_headers:
+                        return
+
+                    resp_url = str(getattr(response, "url", "") or "")
+                    target_hosts = {
+                        (urlparse(resp_url).hostname or "").lower(),
+                        (urlparse(page_url).hostname or "").lower(),
+                    }
+                    target_hosts = {h for h in target_hosts if h}
+                    response_cookies = self._parse_set_cookie_headers_to_cookies(set_cookie_headers, target_hosts)
+                    if not response_cookies:
+                        return
+
+                    if self.debug:
+                        logger.debug(
+                            "Browser %s: response cookies captured url=%s names=%s",
+                            getattr(response.request, "resource_type", "unknown"),
+                            resp_url,
+                            [str(c.get("name") or "").strip() for c in response_cookies],
+                        )
+
+                    last_document_set_cookie_headers.clear()
+                    last_document_set_cookie_headers.extend(set_cookie_headers)
+                    last_document_response_cookies[:] = response_cookies
+                    parsed_response_d = self._select_last_response_d_value(set_cookie_headers)
+                    if parsed_response_d:
+                        last_document_response_d_value[0] = parsed_response_d
+
+                    response_cookie_map: Dict[str, Dict[str, Any]] = {}
+                    for cookie in response_cookies:
+                        cname = str(cookie.get("name") or "").strip().lower()
+                        if cname:
+                            response_cookie_map[cname] = cookie
+
+                    current_cookies = await context.cookies()
+                    merged_current: List[Dict[str, Any]] = []
+                    current_names: set = set()
+                    for cookie in current_cookies:
+                        cname = str(cookie.get("name") or "").strip().lower()
+                        if not cname:
+                            continue
+                        current_names.add(cname)
+                        merged_current.append(response_cookie_map.get(cname, cookie))
+
+                    for cookie in response_cookies:
+                        cname = str(cookie.get("name") or "").strip().lower()
+                        if cname and cname not in current_names:
+                            merged_current.append(cookie)
+
+                    if merged_current:
+                        await context.add_cookies([
+                            {k: v for k, v in cookie.items() if k in {"name", "value", "domain", "path", "expires", "httpOnly", "secure", "sameSite", "partitionKey"}}
+                            for cookie in merged_current
+                            if str(cookie.get("name") or "").strip()
+                        ])
+                        if self.debug:
+                            names = [str(c.get("name") or "").strip() for c in merged_current]
+                            logger.debug(
+                                "Browser %s: merged response cookies -> names=%s d=%s locl=%s",
+                                getattr(response.request, "resource_type", "unknown"),
+                                names,
+                                self._has_cookie_name(merged_current, "d"),
+                                self._has_cookie_name(merged_current, "locl"),
+                            )
+                except Exception:
+                    pass
+
             def _capture_turnstile_request(req) -> None:
                 if not _is_turnstile_request(req):
                     return
@@ -2513,20 +3414,31 @@ class TurnstileAPIServer:
                     headers = dict(getattr(req, "headers", {}) or {})
                 except Exception:
                     headers = {}
+                post_data_excerpt = ""
+                has_turnstile_response_field = False
+                try:
+                    post_data = str(getattr(req, "post_data", "") or "")
+                    if post_data:
+                        has_turnstile_response_field = "cf-turnstile-response=" in post_data
+                        post_data_excerpt = self._trim_text(post_data, 320)
+                except Exception:
+                    pass
                 entry = {
                     "url": req_url,
                     "method": getattr(req, "method", None),
                     "resource_type": getattr(req, "resource_type", None),
                     "headers": headers,
+                    "has_turnstile_response_field": has_turnstile_response_field,
+                    "post_data_excerpt": post_data_excerpt,
                 }
                 _push_limited(turnstile_capture["requests"], entry)
 
-            def _on_response(response):
+            async def _on_response_async(response):
                 try:
-                    h = response.headers
-                    sc = h.get("set-cookie") or h.get("Set-Cookie")
-                    if sc and sc not in set_cookie_headers:
-                        set_cookie_headers.append(sc)
+                    try:
+                        h = dict(await response.all_headers())
+                    except Exception:
+                        h = dict(response.headers or {})
                     req = response.request
                     if req.resource_type == "document":
                         last_document_request_headers.clear()
@@ -2546,23 +3458,25 @@ class TurnstileAPIServer:
                             last_document_request_body[0] = req.post_data
                         except Exception:
                             last_document_request_body[0] = None
-                    if _is_turnstile_request(req):
-                        try:
-                            resp_url = str(response.url)
-                        except Exception:
-                            resp_url = ""
-                        if resp_url not in turnstile_seen["response_urls"]:
-                            turnstile_seen["response_urls"].add(resp_url)
-                            _push_limited(turnstile_capture["responses"], {
-                                "url": resp_url,
-                                "status": getattr(response, "status", None),
-                                "status_text": getattr(response, "status_text", ""),
-                                "resource_type": getattr(req, "resource_type", None),
-                                "request_headers": dict(getattr(req, "headers", {}) or {}),
-                                "response_headers": dict(h or {}),
-                            })
+                    await _capture_response_set_cookies(response, h)
                 except Exception:
                     pass
+
+            def _on_response(response):
+                try:
+                    task = asyncio.create_task(_on_response_async(response))
+                    response_capture_tasks.add(task)
+                    task.add_done_callback(lambda t: response_capture_tasks.discard(t))
+                except Exception:
+                    pass
+
+            async def _flush_response_capture_tasks() -> None:
+                if not response_capture_tasks:
+                    return
+                pending = [task for task in list(response_capture_tasks) if not task.done()]
+                if not pending:
+                    return
+                await asyncio.gather(*pending, return_exceptions=True)
 
             def _on_request_failed(req):
                 try:
@@ -2598,8 +3512,6 @@ class TurnstileAPIServer:
             page.on("response", _on_response)
             page.on("requestfailed", _on_request_failed)
 
-            page_url = self._normalize_page_url(url)
-
             try:
                 if self.debug:
                     logger.debug(
@@ -2612,6 +3524,7 @@ class TurnstileAPIServer:
 
                 await asyncio.sleep(1.5)
                 await self._try_click_turnstile(page)
+                await asyncio.sleep(1.0)
 
                 init_host = (urlparse(page_url).hostname or "").lower()
 
@@ -2626,25 +3539,87 @@ class TurnstileAPIServer:
                     hs = {h for h in (fh, init_host) if h}
                     raw = await context.cookies()
                     if not hs:
-                        return list(raw)
-                    return [c for c in raw if _cookie_matches(hs, c.get("domain", ""))]
+                        return self._merge_cookie_stores(list(raw), last_document_response_cookies)
+                    filtered = [c for c in raw if _cookie_matches(hs, c.get("domain", ""))]
+                    return self._merge_cookie_stores(filtered, last_document_response_cookies)
 
                 turnstile_check = ""
                 session_via_dl = False
-                for attempt in range(200):
+                cf_clearance_seen_at: Optional[float] = None
+                cf_clearance_grace = self._cf_clearance_grace_seconds()
+                require_d_locl_only = self._require_d_and_locl_only()
+                token_seen_at: Optional[float] = None
+                token_post_wait = self._turnstile_token_post_wait_seconds()
+                token_form_submit_attempted = False
+                token_form_submit_result: Dict[str, Any] = {}
+                max_poll_attempts = 200
+                if solve_timeout is not None:
+                    max_poll_attempts = max(200, int((solve_timeout / 0.35) + 40))
+                for attempt in range(max_poll_attempts):
                     jar = await _filtered_jar()
+                    jar = self._overlay_injected_non_d_cookies(jar, injected_cookie_header)
 
-                    if self._has_usable_session_cookies(jar):
+                    has_d_locl = self._has_new_d_after_injected(jar, injected_cookie_header)
+                    has_cf_clearance = self._has_cf_clearance(jar)
+                    if has_d_locl:
                         session_via_dl = True
                         if self.debug:
                             logger.debug(
                                 f"Browser {index}: session cookies detected (attempt {attempt}), capturing now"
                             )
                         break
+                    if has_cf_clearance and not require_d_locl_only:
+                        now = time.time()
+                        if cf_clearance_seen_at is None:
+                            cf_clearance_seen_at = now
+                            if self.debug:
+                                logger.debug(
+                                    "Browser %s: cf_clearance detected (attempt %s), waiting %.1fs for d/locl",
+                                    index,
+                                    attempt,
+                                    cf_clearance_grace,
+                                )
+                        elif (now - cf_clearance_seen_at) >= cf_clearance_grace:
+                            session_via_dl = True
+                            if self.debug:
+                                logger.debug(
+                                    "Browser %s: cf_clearance grace elapsed (%.1fs), accepting clearance-only session",
+                                    index,
+                                    cf_clearance_grace,
+                                )
+                            break
 
                     turnstile_check = await self._read_turnstile_token(page)
                     if turnstile_check:
-                        break
+                        now = time.time()
+                        if token_seen_at is None:
+                            token_seen_at = now
+                        if not token_form_submit_attempted:
+                            token_form_submit_attempted = True
+                            token_form_submit_result = await self._playwright_submit_turnstile_form(page, turnstile_check)
+                            if self.debug:
+                                logger.debug(
+                                    "Browser %s: token detected (attempt %s); form submit probe=%s",
+                                    index,
+                                    attempt,
+                                    token_form_submit_result,
+                                )
+                            await asyncio.sleep(0.8)
+                            continue
+                        if self._has_new_d_after_injected(jar, injected_cookie_header):
+                            session_via_dl = True
+                            break
+                        if require_d_locl_only:
+                            if self.debug and attempt % 25 == 0:
+                                logger.debug(
+                                    "Browser %s: token captured but d/locl not ready yet (attempt %s), continuing strict wait",
+                                    index,
+                                    attempt,
+                                )
+                            await asyncio.sleep(0.35)
+                            continue
+                        if (now - token_seen_at) >= token_post_wait:
+                            break
 
                     if self.debug and attempt % 25 == 0:
                         logger.debug(f"Browser {index}: Waiting for d/locl or Turnstile token (attempt {attempt})")
@@ -2652,6 +3627,8 @@ class TurnstileAPIServer:
                     if attempt % 4 == 0:
                         await self._try_click_turnstile(page)
                     await asyncio.sleep(0.35)
+
+                await _flush_response_capture_tasks()
 
                 if not turnstile_check and not session_via_dl:
                     elapsed_time = round(time.time() - start_time, 3)
@@ -2683,16 +3660,36 @@ class TurnstileAPIServer:
 
                         if hosts:
                             cookies = [c for c in cookies if _cookie_matches_inner(hosts, c.get("domain", ""))]
+                        if last_document_set_cookie_headers:
+                            cookies = self._merge_cookies_with_set_cookie_headers(
+                                cookies,
+                                last_document_set_cookie_headers,
+                                hosts,
+                            )
                         if self._has_usable_session_cookies(cookies):
                             try:
                                 await page.reload(wait_until="domcontentloaded", timeout=90000)
                             except Exception:
                                 pass
                             await asyncio.sleep(0.35)
+                            await _flush_response_capture_tasks()
+                            await asyncio.sleep(3.0)
                             cookies = await context.cookies()
                             if hosts:
                                 cookies = [c for c in cookies if _cookie_matches_inner(hosts, c.get("domain", ""))]
-                        ch = self._format_cookie_header(cookies)
+                            if last_document_set_cookie_headers:
+                                cookies = self._merge_cookies_with_set_cookie_headers(
+                                    cookies,
+                                    last_document_set_cookie_headers,
+                                    hosts,
+                                )
+                            cookies = self._merge_cookie_stores(cookies, last_document_response_cookies)
+                            cookies = self._normalize_cookie_store(cookies, injected_cookie_header)
+                        cookies = self._normalize_cookie_store(cookies, injected_cookie_header)
+                        response_d = last_document_response_d_value[0] or self._select_last_response_d_value(last_document_set_cookie_headers)
+                        if response_d:
+                            cookies = self._replace_cookie_value_by_name(cookies, "d", response_d)
+                        ch = self._format_cookie_header_excluding_injected_d(cookies, injected_cookie_header)
                         req_snap = dict(last_document_request_headers)
                         if ch and "cookie" not in {k.lower() for k in req_snap}:
                             req_snap["cookie"] = ch
@@ -2701,9 +3698,12 @@ class TurnstileAPIServer:
                         sess["d_locl_cookie_header"] = self._d_locl_cookie_header(cookies)
                         sess["request_headers"] = req_snap
                         sess["response_headers"] = dict(last_document_response_headers)
-                        sess["set_cookie_headers"] = list(set_cookie_headers)
                         sess["ip_preflight"] = ip_preflight
                         sess["turnstile_headers"] = turnstile_capture
+                        sess["cf_clearance_grace_seconds"] = cf_clearance_grace
+                        sess["require_d_locl_only"] = require_d_locl_only
+                        sess["token_post_wait_seconds"] = token_post_wait
+                        sess["token_form_submit_result"] = token_form_submit_result
                         self._attach_http_capture(sess, dict(last_document_request_headers), last_document_request_body)
                     except Exception:
                         pass
@@ -2735,9 +3735,15 @@ class TurnstileAPIServer:
                                 "document_failure_text": last_document_failure_text[0],
                                 "request_headers": sess.get("request_headers"),
                                 "response_headers": sess.get("response_headers"),
-                                "set_cookie_headers": sess.get("set_cookie_headers"),
+                                "set_cookie_headers": [],
                                 "ip_preflight": ip_preflight,
                                 "turnstile_headers": turnstile_capture,
+                                "cf_clearance_grace_seconds": cf_clearance_grace,
+                                "require_d_locl_only": require_d_locl_only,
+                                "token_post_wait_seconds": token_post_wait,
+                                "token_form_submit_result": token_form_submit_result,
+                                "injected_cookie_names": injected_cookie_names,
+                                "injected_cookie_add_count": injected_cookie_add_count,
                             },
                         )
                         self.results[task_id] = failure_payload
@@ -2756,9 +3762,49 @@ class TurnstileAPIServer:
                         except Exception:
                             pass
                         await asyncio.sleep(2.5)
+                    await _flush_response_capture_tasks()
 
                     cookies = await _filtered_jar()
-                    cookie_header = self._format_cookie_header(cookies)
+                    cookies = self._overlay_injected_non_d_cookies(cookies, injected_cookie_header)
+                    final_host = (urlparse(page.url).hostname or "").lower()
+                    init_host_cookie = (urlparse(page_url).hostname or "").lower()
+                    hosts = {h for h in (final_host, init_host_cookie) if h}
+                    if require_d_locl_only and not self._has_new_d_after_injected(cookies, injected_cookie_header):
+                        elapsed_time = round(time.time() - start_time, 3)
+                        diagnostics = await self._collect_page_diagnostics(page)
+                        reason = self._classify_solve_failure_reason(diagnostics, cookies or [])
+                        payload = await self._build_failure_payload(
+                            elapsed_time=elapsed_time,
+                            reason=reason,
+                            page=page,
+                            cookies=cookies,
+                            extra={
+                                "url_initial": page_url,
+                                "url_final": page.url,
+                                "document_response_status": last_document_status[0],
+                                "document_response_status_text": last_document_status_text[0],
+                                "document_response_url": last_document_url[0],
+                                "document_failure_text": last_document_failure_text[0],
+                                "set_cookie_headers": [],
+                                "ip_preflight": ip_preflight,
+                                "turnstile_headers": turnstile_capture,
+                                "cf_clearance_grace_seconds": cf_clearance_grace,
+                                "require_d_locl_only": require_d_locl_only,
+                                "token_post_wait_seconds": token_post_wait,
+                                "token_form_submit_result": token_form_submit_result,
+                                "injected_cookie_names": injected_cookie_names,
+                                "injected_cookie_add_count": injected_cookie_add_count,
+                                "message": "Strict d+locl mode enabled: token/cf_clearance observed but d/locl are not ready yet.",
+                            },
+                        )
+                        self.results[task_id] = payload
+                        self._save_results()
+                        self._log_failure_payload(index, task_id, payload)
+                        return
+                    response_d = last_document_response_d_value[0] or self._select_last_response_d_value(last_document_set_cookie_headers)
+                    if response_d:
+                        cookies = self._replace_cookie_value_by_name(cookies, "d", response_d)
+                    cookie_header = self._format_cookie_header_excluding_injected_d(cookies, injected_cookie_header)
                     elapsed_time = round(time.time() - start_time, 3)
 
                     if turnstile_check:
@@ -2767,9 +3813,14 @@ class TurnstileAPIServer:
                             f"{COLORS.get('GREEN')}{elapsed_time}{COLORS.get('RESET')}s | final URL {page.url}"
                         )
                     else:
-                        logger.success(
-                            f"Browser {index}: d + locl captured in {COLORS.get('GREEN')}{elapsed_time}{COLORS.get('RESET')}s — {page.url}"
-                        )
+                        if self._has_new_d_after_injected(cookies, injected_cookie_header):
+                            logger.success(
+                                f"Browser {index}: d + locl captured in {COLORS.get('GREEN')}{elapsed_time}{COLORS.get('RESET')}s — {page.url}"
+                            )
+                        else:
+                            logger.success(
+                                f"Browser {index}: session cookies captured in {COLORS.get('GREEN')}{elapsed_time}{COLORS.get('RESET')}s — {page.url}"
+                            )
 
                     req_hdrs = dict(last_document_request_headers)
                     if cookie_header and "cookie" not in {k.lower() for k in req_hdrs}:
@@ -2788,15 +3839,26 @@ class TurnstileAPIServer:
                         "d_locl_cookie_header": self._d_locl_cookie_header(cookies),
                         "request_headers": req_hdrs,
                         "response_headers": dict(last_document_response_headers),
-                        "set_cookie_headers": list(set_cookie_headers),
+                        "set_cookie_headers": [],
                         "ip_preflight": ip_preflight,
                         "turnstile_headers": turnstile_capture,
+                        "cf_clearance_grace_seconds": cf_clearance_grace,
+                        "require_d_locl_only": require_d_locl_only,
+                        "token_post_wait_seconds": token_post_wait,
+                        "token_form_submit_result": token_form_submit_result,
+                        "injected_cookie_names": injected_cookie_names,
+                        "injected_cookie_add_count": injected_cookie_add_count,
                     }
                     if session_via_dl and not turnstile_check:
                         payload["turnstile_token"] = None
-                        payload["note"] = (
-                            "Session cookies `d` and `locl` were detected in the jar; headers captured immediately."
-                        )
+                        if self._has_new_d_after_injected(cookies, injected_cookie_header):
+                            payload["note"] = (
+                                "Session cookies `d` and `locl` were detected in the jar; headers captured immediately."
+                            )
+                        else:
+                            payload["note"] = (
+                                "cf_clearance was captured and no d/locl arrived before the current stop condition."
+                            )
 
                     self._attach_http_capture(payload, dict(last_document_request_headers), last_document_request_body)
 
@@ -2820,6 +3882,12 @@ class TurnstileAPIServer:
                         "browser_type": effective_browser_type,
                         "browser_backend": effective_browser_type,
                         "turnstile_headers": turnstile_capture if 'turnstile_capture' in locals() else None,
+                        "cf_clearance_grace_seconds": cf_clearance_grace if 'cf_clearance_grace' in locals() else None,
+                        "require_d_locl_only": require_d_locl_only if 'require_d_locl_only' in locals() else None,
+                        "token_post_wait_seconds": token_post_wait if 'token_post_wait' in locals() else None,
+                        "token_form_submit_result": token_form_submit_result if 'token_form_submit_result' in locals() else None,
+                        "injected_cookie_names": injected_cookie_names if 'injected_cookie_names' in locals() else [],
+                        "injected_cookie_add_count": injected_cookie_add_count if 'injected_cookie_add_count' in locals() else 0,
                     },
                 )
                 self.results[task_id] = payload
@@ -2843,6 +3911,9 @@ class TurnstileAPIServer:
                     "url_initial": url,
                     "browser_type": effective_browser_type,
                     "browser_backend": effective_browser_type,
+                    "cf_clearance_grace_seconds": self._cf_clearance_grace_seconds(),
+                    "require_d_locl_only": self._require_d_and_locl_only(),
+                    "token_post_wait_seconds": self._turnstile_token_post_wait_seconds(),
                 },
             )
             self.results[task_id] = payload
@@ -2869,6 +3940,18 @@ class TurnstileAPIServer:
         timeout_raw = request.args.get('timeout')
         browser_raw = request.args.get("browser") or request.args.get("browser_type")
         proxy_raw = request.args.get("proxy")
+        injected_cookie_raw = (
+            request.args.get("cookies")
+            or request.args.get("cookie")
+            or request.args.get("cookie_header")
+        )
+        injected_cookie_header = str(injected_cookie_raw or "").strip() or None
+        injected_cookie_names = [cookie["name"] for cookie in self._parse_cookie_header_pairs(injected_cookie_header)]
+        if injected_cookie_header and not injected_cookie_names:
+            return jsonify({
+                "status": "error",
+                "error": "Invalid 'cookies': expected a Cookie header value like 'name=value; other=value'",
+            }), 400
         try:
             requested_browser_type = self._normalize_browser_type(browser_raw)
         except ValueError as e:
@@ -2925,7 +4008,7 @@ class TurnstileAPIServer:
         self.results[task_id] = "CAPTCHA_NOT_READY"
         logger.info(
             "Turnstile request accepted | task_id=%s url=%s sitekey=%s browser=%s headless=%s timeout=%s "
-            "proxy_override=%s proxy_auth=%s reverse_proxy=%s reverse_proxy_style=%s thread=%s",
+            "proxy_override=%s proxy_auth=%s reverse_proxy=%s reverse_proxy_style=%s injected_cookies=%s thread=%s",
             task_id,
             self._trim_text(url, 180),
             "provided" if sitekey else "none",
@@ -2936,6 +4019,7 @@ class TurnstileAPIServer:
             bool(self._proxy_has_auth(proxy_cfg_override)),
             reverse_proxy_base or None,
             reverse_proxy_style_effective,
+            injected_cookie_names,
             self.thread_count,
         )
 
@@ -2952,6 +4036,7 @@ class TurnstileAPIServer:
                 proxy_cfg_override,
                 reverse_proxy_base,
                 reverse_proxy_style_effective,
+                injected_cookie_header,
             )
 
             if self.debug:
@@ -3016,7 +4101,7 @@ def parse_args():
         action='store_true',
         help='Enable debug mode for both solver logs and Quart server diagnostics',
     )
-    parser.add_argument('--browser_type', type=str, default='seleniumbase', help='Specify the default browser type for the solver. Supported options: chromium, playwright, chrome, msedge, camoufox, seleniumbase (default: seleniumbase)')
+    parser.add_argument('--browser_type', type=str, default='chromium', help='Specify the default browser type for the solver. Supported options: chromium, playwright, chrome, msedge, camoufox, seleniumbase (default: chromium)')
     parser.add_argument('--thread', type=int, default=1, help='Set the number of browser threads to use for multi-threaded mode. Increasing this will speed up execution but requires more resources (default: 1)')
     parser.add_argument('--proxy', action='store_true', help='Pick a random proxy from proxies.txt for each solve')
     parser.add_argument('--host', type=str, default='127.0.0.1', help='Specify the IP address where the API solver runs. (Default: 127.0.0.1)')

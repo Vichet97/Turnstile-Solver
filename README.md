@@ -112,7 +112,7 @@ python api_solver.py --help
 | `--headless` | `False` | flag | Run browser headless. For non-camoufox browsers, you must also set `--useragent`. |
 | `--useragent` | `None` | string | Custom User-Agent. |
 | `--debug` | `False` | flag | Enable solver debug logs + Quart debug diagnostics. |
-| `--browser_type` | `seleniumbase` | string | Default backend: `chromium`, `playwright`, `chrome`, `msedge`, `camoufox` (if installed), `seleniumbase` (if installed). |
+| `--browser_type` | `chromium` | string | Default backend: `chromium`, `playwright`, `chrome`, `msedge`, `camoufox` (if installed), `seleniumbase` (if installed). |
 | `--thread` | `1` | int | Browser worker count for pooled async backends. |
 | `--proxy` | `False` | flag | Enable random proxy selection from `proxies.txt`. |
 | `--host` | `127.0.0.1` | string | API bind host. |
@@ -136,6 +136,7 @@ python api_solver.py --help
 | `timeout` | No | `120` | Per-task timeout in seconds. Clamped to max `86400`. |
 | `browser` or `browser_type` | No | server default | Per-request backend override. Aliases accepted: `playwrite`→`playwright`, `selenium`/`sb`→`seleniumbase`. |
 | `proxy` | No | `None` | Per-request outbound proxy override. Supports multiple formats (see [Proxy details](#proxy-and-reverse-proxy-details)). |
+| `cookies` (alias: `cookie`, `cookie_header`) | No | `None` | Cookie header string to inject on the target domain before navigation (example: `cf_clearance=...; d=...`). |
 | `reverse_proxy` | No | `None` | Worker reverse-proxy base URL. Optional `/SCHEMA` suffix forces full-style tails. |
 | `reverse_proxy_style` | No | `host` | `host` or `full`. Ignored when `reverse_proxy` ends with `/SCHEMA`. |
 
@@ -183,7 +184,13 @@ curl "http://127.0.0.1:5000/turnstile?url=https://goplay.ml&reverse_proxy=https:
 curl "http://127.0.0.1:5000/turnstile?url=https://goplay.ml&reverse_proxy=https://as.mykhcdn.workers.dev/SCHEMA"
 ```
 
-#### H) Poll result
+#### H) Submit with injected target cookies
+
+```bash
+curl "http://127.0.0.1:5000/turnstile?url=https://goplay.ml&cookies=cf_clearance%3DrhI%3B%20d%3D%2BK6l"
+```
+
+#### I) Poll result
 
 ```bash
 curl "http://127.0.0.1:5000/result?id=YOUR_TASK_ID"
@@ -256,7 +263,7 @@ result = get_turnstile_token(
     debug=True,
     headless=False,
     useragent=None,
-    browser_type="seleniumbase",
+    browser_type="chromium",
 )
 
 print(result)
@@ -277,7 +284,7 @@ async def main():
         debug=True,
         headless=False,
         useragent=None,
-        browser_type="seleniumbase",
+        browser_type="chromium",
     )
     print(result)
 
@@ -297,7 +304,7 @@ These are arguments for `sync_solver.get_turnstile_token()` and `async_solver.ge
 | `debug` | No | `False` | Enable debug logs. |
 | `headless` | No | `False` | Run headless (UA requirement still applies for non-camoufox). |
 | `useragent` | No | `None` | Custom User-Agent. |
-| `browser_type` | No | `seleniumbase` | `chromium`, `chrome`, `msedge`, `camoufox` (if installed), `seleniumbase` (if installed). |
+| `browser_type` | No | `chromium` | `chromium`, `chrome`, `msedge`, `camoufox` (if installed), `seleniumbase` (if installed). |
 
 ---
 
@@ -373,7 +380,7 @@ docker compose logs -f --tail=200
 | `XRDP_PASSWORD` | `root` | Sets root password for RDP login. |
 | `SOLVER_DISPLAY_MODE` | `xvfb` | `xvfb`, `rdp`, or `auto`. `rdp` renders headed browser in XRDP session display. |
 | `RDP_SESSION_WAIT_SECONDS` | `0` | Wait time for XRDP display detection in `rdp` mode. `0` = wait indefinitely. |
-| `SOLVER_BROWSER_TYPE` | `seleniumbase` | Default solver backend for API startup. |
+| `SOLVER_BROWSER_TYPE` | `chromium` | Default solver backend for API startup. |
 | `SOLVER_THREAD` | `1` | API worker count (for pooled async backends). |
 | `SOLVER_HEADLESS` | `false` | Adds `--headless` to API command if true. |
 | `SOLVER_DEBUG` | `false` | Adds `--debug` to API command if true. |
@@ -382,7 +389,9 @@ docker compose logs -f --tail=200
 | `SELENIUMBASE_PREWARM` | `true` | Prewarm SeleniumBase driver at startup. |
 | `SELENIUMBASE_PREFETCH_DRIVER` | `true` | Run `sbase get chromedriver` / `uc_driver` prefetch on startup. |
 | `SELENIUMBASE_GUI_CLICK` | `false` (recommended in Docker) | Enables SeleniumBase GUI click helpers; disabled by default for stability. |
-| `TURNSTILE_REQUIRE_D_LOCL` | `false` | If `true`, only `d+locl` counts as a successful session capture; if `false`, `cf_clearance`-only captures are also accepted. |
+| `TURNSTILE_REQUIRE_D_LOCL` | `true` | If `true`, only `d+locl` counts as a successful session capture; if `false`, `cf_clearance`-only captures are also accepted. |
+| `TURNSTILE_CF_CLEARANCE_GRACE_SECONDS` | `10` | In relaxed mode (`TURNSTILE_REQUIRE_D_LOCL=false`), wait this many seconds after `cf_clearance` appears before accepting a clearance-only session. |
+| `TURNSTILE_TOKEN_POST_WAIT_SECONDS` | `15` | After detecting `cf-turnstile-response`, keep polling for downstream cookies (`d/locl`) for this many seconds before finalizing token-only/clearance-only output. |
 | `XVFB_SCREEN_WIDTH` | `1920` | Xvfb virtual screen width. |
 | `XVFB_SCREEN_HEIGHT` | `1080` | Xvfb virtual screen height. |
 | `XVFB_SCREEN_DEPTH` | `24` | Xvfb color depth. |

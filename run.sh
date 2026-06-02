@@ -89,7 +89,7 @@ prefetch_seleniumbase_drivers() {
             ;;
     esac
 
-    browser_lc="$(echo "${SOLVER_BROWSER_TYPE:-seleniumbase}" | tr '[:upper:]' '[:lower:]')"
+    browser_lc="$(echo "${SOLVER_BROWSER_TYPE:-chromium}" | tr '[:upper:]' '[:lower:]')"
     case "$browser_lc" in
         seleniumbase|selenium|sb)
             ;;
@@ -171,7 +171,7 @@ if [ "${RUN_API_SOLVER:-false}" = "true" ]; then
     SOLVER_DISPLAY_MODE="${SOLVER_DISPLAY_MODE:-xvfb}"
     SOLVER_DISPLAY_MODE_LC="$(echo "$SOLVER_DISPLAY_MODE" | tr '[:upper:]' '[:lower:]')"
     RDP_SESSION_WAIT_SECONDS="${RDP_SESSION_WAIT_SECONDS:-0}"
-    SOLVER_BROWSER_TYPE="${SOLVER_BROWSER_TYPE:-seleniumbase}"
+    SOLVER_BROWSER_TYPE="${SOLVER_BROWSER_TYPE:-chromium}"
     SOLVER_THREAD="${SOLVER_THREAD:-1}"
     XVFB_SCREEN_WIDTH="${XVFB_SCREEN_WIDTH:-1920}"
     XVFB_SCREEN_HEIGHT="${XVFB_SCREEN_HEIGHT:-1080}"

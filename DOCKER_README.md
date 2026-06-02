@@ -67,14 +67,14 @@ The Docker setup includes:
 - **Memory Limit**: 4GB
 - **Shared Memory**: 2GB (for browser stability)
 - **Auto-restart**: Unless stopped manually
-- **Default Browser**: SeleniumBase (Chrome backend)
+- **Default Browser**: Chromium (`SOLVER_BROWSER_TYPE=chromium`)
 - **Browser Override**: Set `SOLVER_BROWSER_TYPE` (for example `chromium` or `playwright`)
 - **Virtual GUI Geometry**: `1920x1080x24` with `96 DPI` (Xvfb)
 - **RDP with API mode**: enabled by default via `ENABLE_RDP_WITH_API=true` and `user: "0:0"` in `docker-compose.yml`
 
 ## Browser Support
 
-**Note**: Docker now defaults to SeleniumBase (`SOLVER_BROWSER_TYPE=seleniumbase`). You can still switch to `chromium` or `playwright` by overriding `SOLVER_BROWSER_TYPE` in `docker-compose.yml` or container env vars.
+**Note**: Docker now defaults to Chromium (`SOLVER_BROWSER_TYPE=chromium`). You can still switch to `playwright`, `seleniumbase`, or `camoufox` by overriding `SOLVER_BROWSER_TYPE` in `docker-compose.yml` or container env vars.
 
 ## Virtual GUI tuning (Turnstile visibility)
 

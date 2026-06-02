@@ -15,7 +15,7 @@ services:
       - ENABLE_RDP_WITH_API=true
       - SOLVER_DISPLAY_MODE=auto
       - RDP_SESSION_WAIT_SECONDS=15
-      - SOLVER_BROWSER_TYPE=seleniumbase
+      - SOLVER_BROWSER_TYPE=chromium
       - SOLVER_THREAD=1
       - SELENIUMBASE_PREWARM=true
       - SELENIUMBASE_PREFETCH_DRIVER=true
