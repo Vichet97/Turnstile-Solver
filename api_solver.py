@@ -1354,7 +1354,10 @@ class TurnstileAPIServer:
         return TurnstileAPIServer._format_cookie_header(filtered)
 
     @staticmethod
-    def _select_last_response_d_value(set_cookie_headers: List[str]) -> Optional[str]:
+    def _select_last_response_cookie_value(set_cookie_headers: List[str], cookie_name: str) -> Optional[str]:
+        target_name = str(cookie_name or "").strip().lower()
+        if not target_name:
+            return None
         selected = None
         for raw in (set_cookie_headers or []):
             parsed = SimpleCookie()
@@ -1364,13 +1367,17 @@ class TurnstileAPIServer:
                 continue
             for morsel in parsed.values():
                 name = str(morsel.key or '').strip().lower()
-                if name != 'd':
+                if name != target_name:
                     continue
                 value = str(morsel.value or '').strip()
                 if not value or TurnstileAPIServer._is_deleted_cookie_value(value):
                     continue
                 selected = value
         return selected
+
+    @staticmethod
+    def _select_last_response_d_value(set_cookie_headers: List[str]) -> Optional[str]:
+        return TurnstileAPIServer._select_last_response_cookie_value(set_cookie_headers, 'd')
 
     @staticmethod
     def _normalize_cookie_store(cookies: List[Dict[str, Any]], injected_cookie_header: Optional[str] = None) -> List[Dict[str, Any]]:
@@ -3686,9 +3693,19 @@ class TurnstileAPIServer:
                             cookies = self._merge_cookie_stores(cookies, last_document_response_cookies)
                             cookies = self._normalize_cookie_store(cookies, injected_cookie_header)
                         cookies = self._normalize_cookie_store(cookies, injected_cookie_header)
-                        response_d = last_document_response_d_value[0] or self._select_last_response_d_value(last_document_set_cookie_headers)
-                        if response_d:
+                        response_d = self._select_last_response_cookie_value(last_document_set_cookie_headers, "d")
+                        response_locl = self._select_last_response_cookie_value(last_document_set_cookie_headers, "locl")
+                        response_cf_clearance = self._select_last_response_cookie_value(last_document_set_cookie_headers, "cf_clearance")
+                        cookie_map = self._cookie_value_map(cookies, injected_cookie_header)
+                        current_d = str(cookie_map.get("d") or "").strip()
+                        current_locl = str(cookie_map.get("locl") or "").strip()
+                        current_cf_clearance = str(cookie_map.get("cf_clearance") or "").strip()
+                        if response_d and (not current_d or self._is_deleted_cookie_value(current_d)):
                             cookies = self._replace_cookie_value_by_name(cookies, "d", response_d)
+                        if response_locl and (not current_locl or self._is_deleted_cookie_value(current_locl)):
+                            cookies = self._replace_cookie_value_by_name(cookies, "locl", response_locl)
+                        if response_cf_clearance and (not current_cf_clearance or self._is_deleted_cookie_value(current_cf_clearance)):
+                            cookies = self._replace_cookie_value_by_name(cookies, "cf_clearance", response_cf_clearance)
                         ch = self._format_cookie_header_excluding_injected_d(cookies, injected_cookie_header)
                         req_snap = dict(last_document_request_headers)
                         if ch and "cookie" not in {k.lower() for k in req_snap}:
@@ -3801,9 +3818,19 @@ class TurnstileAPIServer:
                         self._save_results()
                         self._log_failure_payload(index, task_id, payload)
                         return
-                    response_d = last_document_response_d_value[0] or self._select_last_response_d_value(last_document_set_cookie_headers)
-                    if response_d:
+                    response_d = self._select_last_response_cookie_value(last_document_set_cookie_headers, "d")
+                    response_locl = self._select_last_response_cookie_value(last_document_set_cookie_headers, "locl")
+                    response_cf_clearance = self._select_last_response_cookie_value(last_document_set_cookie_headers, "cf_clearance")
+                    cookie_map = self._cookie_value_map(cookies, injected_cookie_header)
+                    current_d = str(cookie_map.get("d") or "").strip()
+                    current_locl = str(cookie_map.get("locl") or "").strip()
+                    current_cf_clearance = str(cookie_map.get("cf_clearance") or "").strip()
+                    if response_d and (not current_d or self._is_deleted_cookie_value(current_d)):
                         cookies = self._replace_cookie_value_by_name(cookies, "d", response_d)
+                    if response_locl and (not current_locl or self._is_deleted_cookie_value(current_locl)):
+                        cookies = self._replace_cookie_value_by_name(cookies, "locl", response_locl)
+                    if response_cf_clearance and (not current_cf_clearance or self._is_deleted_cookie_value(current_cf_clearance)):
+                        cookies = self._replace_cookie_value_by_name(cookies, "cf_clearance", response_cf_clearance)
                     cookie_header = self._format_cookie_header_excluding_injected_d(cookies, injected_cookie_header)
                     elapsed_time = round(time.time() - start_time, 3)
 
