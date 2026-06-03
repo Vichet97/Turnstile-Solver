@@ -13,7 +13,7 @@ services:
       - DISPLAY=:99
       - RUN_API_SOLVER=true
       - ENABLE_RDP_WITH_API=true
-      - SOLVER_DISPLAY_MODE=auto
+      - SOLVER_DISPLAY_MODE=rdp
       - RDP_SESSION_WAIT_SECONDS=15
       - SOLVER_BROWSER_TYPE=chromium
       - SOLVER_THREAD=1
